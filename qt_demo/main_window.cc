@@ -53,6 +53,10 @@ MainWindow::MainWindow(unsigned initial_scale, QWidget* parent)
   nudging_check_->setChecked(true);
   toolbar->addWidget(nudging_check_);
 
+  highlight_fallback_check_ = new QCheckBox("高亮兜底线 (Debug)", toolbar);
+  highlight_fallback_check_->setChecked(false);
+  toolbar->addWidget(highlight_fallback_check_);
+
   toolbar->addSeparator();
   auto* fit_btn = new QPushButton("适应全图 (F)", toolbar);
   auto* reset_btn = new QPushButton("局部 100% 视角 (R)", toolbar);
@@ -72,6 +76,8 @@ MainWindow::MainWindow(unsigned initial_scale, QWidget* parent)
           &MainWindow::OnThirdPartyToggled);
   connect(nudging_check_, &QCheckBox::toggled, this,
           &MainWindow::OnChannelNudgingToggled);
+  connect(highlight_fallback_check_, &QCheckBox::toggled, this,
+          &MainWindow::OnHighlightFallbackToggled);
   connect(fit_btn, &QPushButton::clicked, canvas_, &CanvasWidget::FitAll);
   connect(reset_btn, &QPushButton::clicked, canvas_,
           &CanvasWidget::ResetLocalView);
@@ -201,6 +207,10 @@ void MainWindow::OnThirdPartyToggled(bool checked) {
 
 void MainWindow::OnChannelNudgingToggled(bool checked) {
   canvas_->SetEnableChannelNudging(checked);
+}
+
+void MainWindow::OnHighlightFallbackToggled(bool checked) {
+  canvas_->SetHighlightFallback(checked);
 }
 
 void MainWindow::OnPortSpinChanged() {

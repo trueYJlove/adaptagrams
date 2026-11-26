@@ -95,6 +95,107 @@ bool FinitePoint(Point p) {
          std::max(std::abs(p.x), std::abs(p.y)) <= 5e7;
 }
 
+unsigned PrimaryDir(unsigned dirs) {
+  if (dirs & kRight) {
+    return kRight;
+  }
+  if (dirs & kLeft) {
+    return kLeft;
+  }
+  if (dirs & kDown) {
+    return kDown;
+  }
+  return kUp;
+}
+
+std::vector<Point> SimplifyOrtho(std::vector<Point> pts) {
+  pts.erase(std::unique(pts.begin(), pts.end()), pts.end());
+  std::size_t count = 0;
+  for (const Point v : pts) {
+    if (count >= 2 && OrthoDir(pts[count - 2], pts[count - 1]) ==
+                          OrthoDir(pts[count - 1], v)) {
+      --count;
+    }
+    pts[count++] = v;
+  }
+  pts.resize(count);
+  return pts;
+}
+
+std::vector<Point> MakeSimulinkFallback(Point a, Point b, const Block& src,
+                                        const Block& dst, const Pin& sp,
+                                        const Pin& dp, const Config& cfg) {
+  if (a == b) {
+    return {a, b};
+  }
+  const unsigned sd = PrimaryDir(sp.dirs);
+  const unsigned dd = PrimaryDir(dp.dirs);
+
+  // Close/flush forward-facing aligned terminals connect directly in 2 points.
+  if (sd == kRight && dd == kLeft && std::abs(a.y - b.y) <= 1e-3 &&
+      b.x >= a.x - 1e-6) {
+    return {a, b};
+  }
+  if (sd == kLeft && dd == kRight && std::abs(a.y - b.y) <= 1e-3 &&
+      b.x <= a.x + 1e-6) {
+    return {a, b};
+  }
+  if (sd == kDown && dd == kUp && std::abs(a.x - b.x) <= 1e-3 &&
+      b.y >= a.y - 1e-6) {
+    return {a, b};
+  }
+  if (sd == kUp && dd == kDown && std::abs(a.x - b.x) <= 1e-3 &&
+      b.y <= a.y + 1e-6) {
+    return {a, b};
+  }
+
+  const Rect u{
+      std::min(src.rect.l, dst.rect.l), std::min(src.rect.t, dst.rect.t),
+      std::max(src.rect.r, dst.rect.r), std::max(src.rect.b, dst.rect.b)};
+  const double margin = std::max(cfg.buffer * 2.5, 20.0);
+
+  const bool src_horiz = (sd & (kLeft | kRight)) != 0;
+  const bool dst_horiz = (dd & (kLeft | kRight)) != 0;
+  auto outer_x = [&](unsigned dir) {
+    return (dir == kRight) ? (u.r + margin) : (u.l - margin);
+  };
+  auto outer_y = [&](unsigned dir) {
+    return (dir == kDown) ? (u.b + margin) : (u.t - margin);
+  };
+
+  if (src_horiz && dst_horiz) {
+    const double x_out = outer_x(sd);
+    const double x_in = outer_x(dd);
+    const double y_top = u.t - margin;
+    const double y_bot = u.b + margin;
+    const double y_mid = (a.y + b.y) * 0.5;
+    const double y_rail =
+        (std::abs(y_mid - y_top) <= std::abs(y_bot - y_mid)) ? y_top : y_bot;
+    return SimplifyOrtho(
+        {a, {x_out, a.y}, {x_out, y_rail}, {x_in, y_rail}, {x_in, b.y}, b});
+  }
+  if (!src_horiz && !dst_horiz) {
+    const double y_out = outer_y(sd);
+    const double y_in = outer_y(dd);
+    const double x_left = u.l - margin;
+    const double x_right = u.r + margin;
+    const double x_mid = (a.x + b.x) * 0.5;
+    const double x_rail =
+        (std::abs(x_mid - x_left) <= std::abs(x_right - x_mid)) ? x_left
+                                                                : x_right;
+    return SimplifyOrtho(
+        {a, {a.x, y_out}, {x_rail, y_out}, {x_rail, y_in}, {b.x, y_in}, b});
+  }
+  if (src_horiz && !dst_horiz) {
+    const double x_out = outer_x(sd);
+    const double y_in = outer_y(dd);
+    return SimplifyOrtho({a, {x_out, a.y}, {x_out, y_in}, {b.x, y_in}, b});
+  }
+  const double y_out = outer_y(sd);
+  const double x_in = outer_x(dd);
+  return SimplifyOrtho({a, {a.x, y_out}, {x_in, y_out}, {x_in, b.y}, b});
+}
+
 }  // namespace
 
 LocalOrthogonalRouter::LocalOrthogonalRouter(
@@ -349,7 +450,7 @@ Route LocalOrthogonalRouter::SolveOne(const Conn& c, bool settled) const {
     out.outcome = Outcome::kCoincidentPins;
     return out;
   }
-  out.points = Elbow(a, b, true);
+  out.points = MakeSimulinkFallback(a, b, src, dst, sp, dp, cfg_);
   out.status = Status::kDisplayOnly;
   Profile* profile = cfg_.profile ? &out.profile : nullptr;
   auto query = [&](Rect rect) {

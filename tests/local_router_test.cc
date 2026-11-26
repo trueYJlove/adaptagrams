@@ -188,6 +188,44 @@ void TestOverlap() {
   r.AddBlock(MakeBlock(3, {30, 10, 65, 30}));
   r.RouteAllParallel(1);
   CHECK(r.route(1).status == Status::kDisplayOnly && r.route(1).calls == 0);
+
+  // Close forward flush Right -> Left aligned blocks: 2-point short direct.
+  {
+    LocalOrthogonalRouter flush;
+    flush.AddBlock(MakeBlock(1, {0.0, 0.0, 40.0, 40.0}));
+    flush.AddBlock(MakeBlock(2, {44.0, 0.0, 84.0, 40.0}));
+    flush.AddConnector({1, 1, 1, 2, 2});
+    flush.RouteAllParallel(1);
+    const Route& rt = flush.route(1);
+    CHECK(rt.status == Status::kDisplayOnly);
+    CHECK(rt.points.size() == 2);
+    CHECK((rt.points[0] == Point{40.0, 20.0}));
+    CHECK((rt.points[1] == Point{44.0, 20.0}));
+  }
+
+  // Overlapping Right -> Left reversed blocks: Simulink outer-loop fallback.
+  {
+    LocalOrthogonalRouter ov;
+    const Rect r1{100.0, 0.0, 180.0, 60.0};
+    const Rect r2{110.0, 10.0, 190.0, 70.0};
+    ov.AddBlock(MakeBlock(1, r1));
+    ov.AddBlock(MakeBlock(2, r2));
+    ov.AddConnector({1, 1, 1, 2, 2});
+    ov.RouteAllParallel(1);
+    const Route& rt = ov.route(1);
+    CHECK(rt.status == Status::kDisplayOnly);
+    CHECK(rt.points.size() == 6);
+    // First leg exits strictly right, last leg enters from left going right.
+    CHECK(rt.points[0].y == rt.points[1].y);
+    CHECK(rt.points[1].x > rt.points[0].x);
+    CHECK(rt.points[4].y == rt.points[5].y);
+    CHECK(rt.points[4].x < rt.points[5].x);
+    // Horizontal cross-rail lies strictly outside the union bounding box U.
+    const double u_top = std::min(r1.t, r2.t);
+    const double u_bot = std::max(r1.b, r2.b);
+    CHECK(rt.points[2].y == rt.points[3].y);
+    CHECK(rt.points[2].y < u_top || rt.points[2].y > u_bot);
+  }
 }
 
 void TestParallel() {

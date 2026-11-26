@@ -57,8 +57,10 @@ qt_demo/
    * 初始窗口取起止点包围盒外扩 `padding + buffer`，随后每轮重试按 `padding * 2^attempt` 扩张（最多 `retries` 轮）。
    * 若窗口内障碍数超过 `budget`（默认 `120`），优先保留 `required` 集合（起止模块 + 前序轮次实际碰撞到的第三方模块），其余按到起止线段垂直距离用 `std::nth_element` 截断保留最近的障碍物。
    * 求解器返回候选折线后，`accept()` 逐段回查**完整全局 `SpatialGridIndex`**；若发生碰撞，将命中的实际障碍物写入 `required` 并进入下一轮重试。
-4. **兜底降级**：
-   * 若重试耗尽或 `required.size() > budget`，保留确定的 2/3 段正交展示折线并标记 `Status::kDisplayOnly`（附具体 `Outcome`），绝不伪装为 `Status::kValid`。
+4. **Simulink 风格兜底降级（`MakeSimulinkFallback`）**：
+   * 若出现引脚埋入（`Outcome::kBuriedPin`）、重试耗尽或超出障碍预算（`Outcome::kObstacleBudget` / `Outcome::kCollision`），保留 `Status::kDisplayOnly` 语义（绝不伪装为 `Status::kValid`），并按端口方向确定性生成 Simulink 风格几何兜底折线：
+     * **贴边顺向对齐**：`a == b` 或起止方向相对且顺向对齐（如 `Right -> Left` 且 `a.y == b.y && b.x >= a.x`）时直接返回 2 点短连线 `{a, b}`，无多余绕线；
+     * **模块重叠 / 反向越界外环**：基于起止模块联合外包围盒 `U = union(src.rect, dst.rect)` 外扩 `margin = max(buffer * 2.5, 20.0)`，从 `sp.dirs` 沿外侧延伸、从 `dp.dirs` 逆向绕外侧进线，比较上下/左右外侧横梁到起止中心线的距离并择近（等距优先上方/左侧），生成严格满足 `sp.dirs` 与 `dp.dirs` 的干净 6 点 5 段外环（正交或同向组合对称简化）。
 
 ### 3.3 默认求解器：`LazyHananAStarSolver`
 
@@ -234,7 +236,7 @@ localroute::LocalOrthogonalRouter router(cfg, std::make_shared<CustomSolver>());
 3. **GUI 渲染与自由建模能力（`qt_demo`）**：
    * 渲染层通过 `view().QueryBlocks(viewport)` 做模块视口裁剪、为每条连线缓存包围盒做 $O(1)$ 裁剪，并在低缩放倍率下启用合批绘制与 LOD。
    * 支持从左侧**图元库（`LibraryWidget`）**拖拽 7 类预设模块到画布（或从 `0 模块 (空白画布)` 起步），右侧面板及右键菜单支持动态修改选中模块四向端口个数（`左/右 0~16`、`上/下 0~8`），并支持悬停端口拖拽手动连线与 `Del` 删除。
-   * 工具栏内置 `预设: B1-B2 10线平行对连` 与 `预设: B9/B3/B8 级联布线` 视觉验收场景，配合 `通道分轨 (Nudging)` 复选框可一键开关对比分轨效果。
+   * 工具栏内置 `预设: B1-B2 10线平行对连` 与 `预设: B9/B3/B8 级联布线` 视觉验收场景，配合 `通道分轨 (Nudging)` 复选框可一键开关对比分轨效果；默认以普通深蓝线条绘制 `Status::kDisplayOnly` 兜底线以对齐 Simulink 视觉观感，同时提供 `高亮兜底线 (Debug)` 复选框（默认关闭）支持橙色高亮调试。
 4. **近距模块缓冲**：若业务画布允许两个相连模块间距小于 `2 * cfg.buffer`（默认 `16 px`），建议将 `cfg.buffer` 调至 `4.0 ~ 6.0` 以减少缓冲框互叠导致的 `Status::kDisplayOnly` 退化。
 
 ## 7. 万级规模实测性能基线（Release `-O3`，开启 `enable_channel_nudging = true`）

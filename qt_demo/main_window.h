@@ -24,6 +24,7 @@ class MainWindow : public QMainWindow {
   void OnModeChanged(int index);
   void OnThirdPartyToggled(bool checked);
   void OnChannelNudgingToggled(bool checked);
+  void OnHighlightFallbackToggled(bool checked);
   void OnClearCanvas();
   void OnPortSpinChanged();
   void SyncInspectorFromSelection();
@@ -38,6 +39,7 @@ class MainWindow : public QMainWindow {
   QComboBox* mode_combo_ = nullptr;
   QCheckBox* third_party_check_ = nullptr;
   QCheckBox* nudging_check_ = nullptr;
+  QCheckBox* highlight_fallback_check_ = nullptr;
 
   // Inspector controls
   QLabel* sel_title_label_ = nullptr;

@@ -34,6 +34,7 @@ class CanvasWidget : public QWidget {
   void SetRouteMode(RouteMode mode);
   void SetRerouteThirdPartyBlocked(bool enabled);
   void SetEnableChannelNudging(bool enabled);
+  void SetHighlightFallback(bool enabled);
   void RouteAll();
   void FitAll();
   void ResetLocalView();
@@ -56,6 +57,7 @@ class CanvasWidget : public QWidget {
   RouteMode route_mode() const { return mode_; }
   bool reroute_third_party_blocked() const { return third_party_reroute_; }
   bool enable_channel_nudging() const { return channel_nudging_; }
+  bool highlight_fallback() const { return highlight_fallback_; }
   std::size_t selected_block_count() const { return selected_blocks_.size(); }
   bool has_selected_conn() const { return has_selected_conn_; }
   const localroute::LocalOrthogonalRouter& router_view() const {
@@ -130,6 +132,7 @@ class CanvasWidget : public QWidget {
   RouteMode mode_ = RouteMode::kAsync;
   bool third_party_reroute_ = false;
   bool channel_nudging_ = true;
+  bool highlight_fallback_ = false;
   unsigned current_block_count_ = 0;
   unsigned current_conn_count_ = 0;
   localroute::Id next_block_id_ = 1;

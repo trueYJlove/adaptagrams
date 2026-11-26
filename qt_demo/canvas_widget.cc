@@ -467,6 +467,14 @@ void CanvasWidget::SetEnableChannelNudging(bool enabled) {
   RouteAll();
 }
 
+void CanvasWidget::SetHighlightFallback(bool enabled) {
+  if (highlight_fallback_ == enabled) {
+    return;
+  }
+  highlight_fallback_ = enabled;
+  update();
+}
+
 void CanvasWidget::RouteAll() {
   QElapsedTimer timer;
   timer.start();
@@ -1509,12 +1517,16 @@ void CanvasWidget::paintEvent(QPaintEvent* /*event*/) {
       low_detail ? QColor(115, 134, 158, 140) : QColor(115, 134, 158), 1.2,
       low_detail ? Qt::SolidLine : Qt::DashLine);
   pending_pen.setCosmetic(true);
-  QPen display_pen(QColor(230, 126, 34), 1.5);
+  QPen display_pen =
+      highlight_fallback_ ? QPen(QColor(230, 126, 34), 1.5) : valid_pen;
   display_pen.setCosmetic(true);
   QPen hi_valid_pen(QColor(0, 120, 215), 2.2);
   hi_valid_pen.setCosmetic(true);
   QPen hi_pending_pen(QColor(0, 120, 215), 1.8, Qt::DashLine);
   hi_pending_pen.setCosmetic(true);
+  QPen hi_display_pen =
+      highlight_fallback_ ? QPen(QColor(230, 126, 34), 2.2) : hi_valid_pen;
+  hi_display_pen.setCosmetic(true);
 
   QVector<QLineF> valid_segs;
   QVector<QLineF> pending_segs;
@@ -1729,7 +1741,7 @@ void CanvasWidget::paintEvent(QPaintEvent* /*event*/) {
     painter.drawLines(hi_pending_segs);
   }
   if (!hi_display_segs.isEmpty()) {
-    painter.setPen(display_pen);
+    painter.setPen(hi_display_pen);
     painter.drawLines(hi_display_segs);
   }
   visible_conn_count_ = drawn_conns;
