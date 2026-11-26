@@ -1,7 +1,0 @@
-round,mode,process_status,peak_working_mib,solver_name,blocks,scene,threads,samples,avg_ms,p50_ms,p95_ms,p99_ms,max_ms,valid,display_only,failed,solver_calls,retries,window_p99,window_max,unexpected_frames,reused,simple,pending,query_ms,setup_ms,graph_ms,search_ms,validation_ms,other_ms,invalid_attempts,collision_attempts,capped_attempts,coincident,buried,invalid_candidate,collision,budget
-1,async,OK,86.77,async_owner,10000,first_interactive_proxy,1,1,16.3734,16.3734,16.3734,16.3734,16.3734,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
-1,async,OK,86.77,async_owner,10000,async_full,1,1,132201,132201,132201,132201,132201,19624,376,0,22084,4173,120,120,0,0,2089,0,0,0,0,0,0,0,0,0,0,0,0,0,17,359
-1,async,OK,86.77,async_owner,10000,owner_A_proxy,1,100,0.052401,0.0451,0.1159,0.254,0.319,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
-1,async,OK,86.77,async_owner,10000,settled_A,1,1,15.181,15.181,15.181,15.181,15.181,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
-1,async,OK,86.77,async_owner,10000,owner_B20_proxy,1,100,0.097986,0.0884,0.159,0.1886,0.2034,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
-1,async,OK,86.77,async_owner,10000,settled_B20,1,1,460.33,460.33,460.33,460.33,460.33,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
