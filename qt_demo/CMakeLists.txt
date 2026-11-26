@@ -2,11 +2,11 @@ set(CMAKE_AUTOMOC ON)
 find_package(Qt5 COMPONENTS Widgets REQUIRED)
 
 add_executable(qt_demo
-    main.cpp
-    MainWindow.h
-    MainWindow.cpp
-    CanvasWidget.h
-    CanvasWidget.cpp
+    main.cc
+    main_window.h
+    main_window.cc
+    canvas_widget.h
+    canvas_widget.cc
 )
 
 target_include_directories(qt_demo PRIVATE

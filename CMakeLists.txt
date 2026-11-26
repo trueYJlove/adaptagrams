@@ -11,9 +11,9 @@ option(LOCALROUTE_BUILD_QT_DEMO "Build Qt interactive demo" ON)
 find_package(Threads REQUIRED)
 
 add_library(local_router STATIC
-    src/LazyHananAStarSolver.cpp
-    src/LocalOrthogonalRouter.cpp
-    src/AsyncLocalRouter.cpp
+    src/lazy_hanan_a_star_solver.cc
+    src/local_orthogonal_router.cc
+    src/async_local_router.cc
 )
 target_include_directories(local_router PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -23,7 +23,7 @@ target_link_libraries(local_router PUBLIC Threads::Threads)
 
 if(LOCALROUTE_BUILD_TESTS)
     enable_testing()
-    add_executable(test_unit tests/test_unit.cpp)
+    add_executable(test_unit tests/local_router_test.cc)
     target_link_libraries(test_unit PRIVATE local_router)
     foreach(t
         SpatialGridBasic
@@ -39,7 +39,7 @@ if(LOCALROUTE_BUILD_TESTS)
         add_test(NAME local.${t} COMMAND test_unit ${t})
     endforeach()
 
-    add_executable(bench_large_scale tests/bench_large_scale.cpp)
+    add_executable(bench_large_scale tests/bench_large_scale.cc)
     target_link_libraries(bench_large_scale PRIVATE local_router)
 endif()
 

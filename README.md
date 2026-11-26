@@ -1,6 +1,6 @@
 # Local Orthogonal Router (Simulink-Scale C++17 Routing Engine)
 
-零外部依赖的纯 C++17 万级局部正交布线引擎，支持 10,000 模块 / 20,000 连线规模下的亚毫秒级同步局部重算、异步非阻塞增量更新与实时 Qt 交互可视化演示。
+零外部依赖的纯 C++17 万级局部正交布线引擎，支持 10,000 模块 / 20,000 连线规模下的亚毫秒级同步局部重算、异步非阻塞增量更新与实时 Qt 交互可视化演示。代码命名、文件命名与格式规范遵循 **Google C++ Style Guide**（仓库根目录已配置 `.clang-format`）。
 
 > 历史对照基线（包含 `adaptagrams/libavoid` 原生对比与三阶段同台压测记录）已归档于 Git 标签 `v1-libavoid-baseline`，可通过 `git checkout v1-libavoid-baseline` 查看。
 
@@ -8,22 +8,30 @@
 
 ```text
 .
+├── .clang-format                      # Google C++ 代码格式化规范
 ├── CMakeLists.txt
+├── README.md
+├── doc/
+│   └── architecture.md                # 架构设计与 API 接入说明
 ├── include/localroute/
-│   ├── ILocalRouteSolver.h       # 求解器抽象与配置/几何类型
-│   ├── SpatialGridIndex.h        # 2D 空间网格索引
-│   ├── LocalOrthogonalRouter.h   # 同步局部正交路由器
-│   └── AsyncLocalRouter.h        # 异步增量会话与优先级调度
+│   ├── local_route_solver.h           # 求解器抽象 LocalRouteSolver 与配置/几何类型
+│   ├── spatial_grid_index.h           # 2D 空间网格索引
+│   ├── local_orthogonal_router.h      # 同步局部正交路由器
+│   └── async_local_router.h           # 异步增量会话与优先级调度
 ├── src/
-│   ├── LazyHananAStarSolver.cpp  # 零堆链表、阻塞位图 + 两阶段正交 A* 求解器
-│   ├── LocalOrthogonalRouter.cpp # 局部窗口查询、快速复用与全局碰撞复验
-│   └── AsyncLocalRouter.cpp      # 后台工作线程与版本丢弃
+│   ├── lazy_hanan_a_star_solver.cc    # 零堆链表、阻塞位图 + 两阶段正交 A* 求解器
+│   ├── local_orthogonal_router.cc     # 局部窗口查询、快速复用与全局碰撞复验
+│   └── async_local_router.cc          # 后台工作线程与版本丢弃
 ├── tests/
 │   ├── topology_generator.h
-│   ├── test_unit.cpp             # 9 项核心单元与边界测试
-│   ├── bench_large_scale.cpp     # 1k / 3k / 5k / 10k 同步/异步/分项压测
+│   ├── local_router_test.cc           # 9 项核心单元与边界测试
+│   ├── bench_large_scale.cc           # 1k / 3k / 5k / 10k 同步/异步/分项压测
 │   └── run_benchmark.py
-└── qt_demo/                      # 基于 Qt Widgets 视口裁剪 + LOD 的万级交互画布
+└── qt_demo/                           # 基于 Qt Widgets 视口裁剪 + LOD 的万级交互画布
+    ├── CMakeLists.txt
+    ├── canvas_widget.h / .cc
+    ├── main_window.h / .cc
+    └── main.cc
 ```
 
 ## 构建与运行（Windows / VS 2022 + Clang + Ninja + Qt 5）
@@ -40,4 +48,7 @@ out-Release\bench_large_scale.exe local4 10000
 
 # 运行 Qt 万级交互演示（已通过 windeployqt 部署运行依赖）
 out-Release\qt_demo\qt_demo.exe
+
+# 使用 clang-format 检查 / 格式化代码
+clang-format --dry-run --Werror include/localroute/*.h src/*.cc tests/*.h tests/*.cc qt_demo/*.h qt_demo/*.cc
 ```
