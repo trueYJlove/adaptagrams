@@ -81,6 +81,7 @@ struct Config {
   bool fast_paths = true;
   bool profile = false;
   bool reroute_third_party_blocked = false;
+  bool enable_channel_nudging = true;
 };
 
 enum class Status { kValid, kDisplayOnly, kFailed, kPending };

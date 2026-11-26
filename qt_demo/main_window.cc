@@ -26,7 +26,9 @@ MainWindow::MainWindow(unsigned initial_scale, QWidget* parent)
   scale_combo_->addItem("3,000 模块 (6k 线)", 3000);
   scale_combo_->addItem("5,000 模块 (10k 线)", 5000);
   scale_combo_->addItem("10,000 模块 (20k 线)", 10000);
-  const int init_idx = scale_combo_->findData(initial_scale);
+  scale_combo_->addItem("预设: B1-B2 10线平行对连", -1);
+  scale_combo_->addItem("预设: B9/B3/B8 级联布线", -2);
+  const int init_idx = scale_combo_->findData(static_cast<int>(initial_scale));
   scale_combo_->setCurrentIndex(init_idx >= 0 ? init_idx : 4);
   toolbar->addWidget(scale_combo_);
 
@@ -47,6 +49,10 @@ MainWindow::MainWindow(unsigned initial_scale, QWidget* parent)
   third_party_check_->setChecked(false);
   toolbar->addWidget(third_party_check_);
 
+  nudging_check_ = new QCheckBox("通道分轨 (Nudging)", toolbar);
+  nudging_check_->setChecked(true);
+  toolbar->addWidget(nudging_check_);
+
   toolbar->addSeparator();
   auto* fit_btn = new QPushButton("适应全图 (F)", toolbar);
   auto* reset_btn = new QPushButton("局部 100% 视角 (R)", toolbar);
@@ -64,6 +70,8 @@ MainWindow::MainWindow(unsigned initial_scale, QWidget* parent)
           this, &MainWindow::OnModeChanged);
   connect(third_party_check_, &QCheckBox::toggled, this,
           &MainWindow::OnThirdPartyToggled);
+  connect(nudging_check_, &QCheckBox::toggled, this,
+          &MainWindow::OnChannelNudgingToggled);
   connect(fit_btn, &QPushButton::clicked, canvas_, &CanvasWidget::FitAll);
   connect(reset_btn, &QPushButton::clicked, canvas_,
           &CanvasWidget::ResetLocalView);
@@ -165,8 +173,14 @@ void MainWindow::BuildDocks() {
 }
 
 void MainWindow::OnScaleChanged(int index) {
-  const unsigned n = scale_combo_->itemData(index).toUInt();
-  canvas_->LoadTopology(n);
+  const int val = scale_combo_->itemData(index).toInt();
+  if (val == -1) {
+    canvas_->LoadPresetParallelBundle();
+  } else if (val == -2) {
+    canvas_->LoadPresetCascade();
+  } else {
+    canvas_->LoadTopology(static_cast<unsigned>(val));
+  }
 }
 
 void MainWindow::OnClearCanvas() {
@@ -183,6 +197,10 @@ void MainWindow::OnModeChanged(int index) {
 
 void MainWindow::OnThirdPartyToggled(bool checked) {
   canvas_->SetRerouteThirdPartyBlocked(checked);
+}
+
+void MainWindow::OnChannelNudgingToggled(bool checked) {
+  canvas_->SetEnableChannelNudging(checked);
 }
 
 void MainWindow::OnPortSpinChanged() {

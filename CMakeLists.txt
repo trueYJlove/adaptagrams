@@ -13,6 +13,7 @@ find_package(Threads REQUIRED)
 add_library(local_router STATIC
     src/lazy_hanan_a_star_solver.cc
     src/local_orthogonal_router.cc
+    src/channel_nudger.cc
     src/async_local_router.cc
 )
 target_include_directories(local_router PUBLIC
@@ -35,6 +36,8 @@ if(LOCALROUTE_BUILD_TESTS)
         FastReuseAndThirdPartyObstruction
         AsyncDiscardsStaleResults
         LazyHananAStarBoundaryCases
+        ChannelNudgingParallelBundle
+        ChannelNudgingCascadeAndNoHook
     )
         add_test(NAME local.${t} COMMAND test_unit ${t})
     endforeach()

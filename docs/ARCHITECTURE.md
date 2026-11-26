@@ -23,7 +23,14 @@ include/localroute/
 src/
 ├── lazy_hanan_a_star_solver.cc  # 默认求解器：非均匀正交网格 + 二维阻塞位图 + 两阶段正交 A*
 ├── local_orthogonal_router.cc   # 同步路由器实现、退化前置检查与 SVG 调试导出
+├── channel_nudger.h / .cc       # 轻量局部通道分轨（按 NetKey 等距无交叉分轨）
 └── async_local_router.cc        # 异步双副本隔离与代际版本管理实现
+
+qt_demo/
+├── library_widget.h / .cc       # 可拖拽 Simulink 风格图元库（7 种预设模块模板）
+├── canvas_widget.h / .cc        # 自定义高帧率裁剪画布、手动连线、预设拓扑与 HUD
+├── main_window.h / .cc          # 图元库/端口检查器 Dock、预设与运行模式开关
+└── main.cc                      # 交互入口与 `--smoke-bench` 回归校验
 ```
 
 ## 3. 核心算法与机制详解
@@ -43,9 +50,9 @@ src/
    * 起止引脚重合 → 标记 `Outcome::kCoincidentPins`、`Status::kDisplayOnly`；
    * 起点或终点引脚落在第三方模块膨胀缓冲框内部 → 标记 `Outcome::kBuriedPin`、`Status::kDisplayOnly`。
 2. **轻量快路径（`Config::fast_paths = true` 且非松手微调时启用）**：
-   * **整线平移复用（`RouteMethod::kReuse`）**：当起止端点位移量 `(dx, dy)` 完全相等（典型为框选批量拖动内部连线）时，整条旧折线平移后直接复验，命中即微秒级返回。
-   * **端点修补复用（`RouteMethod::kReuse`）**：保持原折线中段不变，仅正交修正首尾拐点衔接新引脚位置并复验。
-   * **L / Z 轻量候选（`RouteMethod::kSimple`）**：尝试 2 段 L 型折线及中点/缓冲边界对齐的 3 段 Z 型折线。
+   * **第一优先级 — 整线平移复用（`RouteMethod::kReuse`）**：当起止端点位移量 `(dx, dy)` 完全相等（典型为框选批量拖动内部连线）时，整条旧折线平移后直接复验，命中即微秒级返回。
+   * **第二优先级 — L / Z 轻量候选（`RouteMethod::kSimple`）**：优先尝试 2 段 L 型折线及中点/缓冲边界对齐的 3 段 Z 型折线并复验；只要拖动后存在无障碍的简洁 2/3 段通路，折线会立即自动收直，彻底消除旧中段残留导致的 4 拐回折尾巴。
+   * **第三优先级 — 端点修补复用（`RouteMethod::kReuse`）**：仅当 `Simple` 被障碍物阻挡无法通过且旧路径 `points.size() >= 3` 时，保持原折线中段不变，仅正交修正首尾拐点衔接新引脚位置并复验。
 3. **局部窗口迭代补障 + 求解器调用（`RouteMethod::kNative`）**：
    * 初始窗口取起止点包围盒外扩 `padding + buffer`，随后每轮重试按 `padding * 2^attempt` 扩张（最多 `retries` 轮）。
    * 若窗口内障碍数超过 `budget`（默认 `120`），优先保留 `required` 集合（起止模块 + 前序轮次实际碰撞到的第三方模块），其余按到起止线段垂直距离用 `std::nth_element` 截断保留最近的障碍物。
@@ -72,11 +79,22 @@ src/
    * **Pass 2（深层绕障回退）**：Pass 1 触及步数上限且队列非空时，复用同一阻塞位图执行 `1.15` 加权 A*（对截断长线窗口叠加对角走廊引导偏置 `0.02 * perp_dist`，上限 `20,000` 步）。
    * 使用 `thread_local SolverWorkspace` 复用所有数组，并通过单调递增的 `run_stamp` 消除每轮大数组清零开销。
 
-### 3.4 异步会话模型（`AsyncLocalRouter`）
+### 3.4 局部通道分轨（`ChannelNudger`，`src/channel_nudger.h/.cc`）
+
+为消除多条独立连线走中间通道时重合叠成单线（如平行对连母线、级联走廊重叠）的问题，系统在 `Config::enable_channel_nudging = true` 时于单次重算/冷启动末尾执行轻量级 $O(K \log K)$ 通道分轨（支持通过 `LocalOrthogonalRouter::set_enable_channel_nudging(bool)` 与 `AsyncLocalRouter::set_enable_channel_nudging(bool)` 运行时切换）：
+
+1. **参与集边界控制**：
+   * 局部重算（`RerouteAffected`、`RouteConnector` 及 `AsyncLocalRouter::Poll` 波次收口）：收集本次变化连线联合包围盒外扩 `max(2 * nudge_distance, 80.0)` 内的邻近模块关联连线，上限严格截断在 **256 条**（确保单拖 P99 不退化）。
+   * 全图冷启动（`RouteAllParallel` 合并后）：对全图 `Status::kValid` 连线按确定性升序 `Id` 执行单趟分轨（保持多线程/单线程冷启动输出完全一致）。
+2. **中间段与电气网表语义（`NetKey`）**：仅平移 `pts.size() >= 4` 连线的中间正交段（索引 `[1, pts.size() - 3]`），绝不篡改起止引脚位置与出线方向；按 `NetKey { src_block, src_pin }` 归组——**同一源引脚扇出允许共享主干，不同 `NetKey` 独立信号强制分轨**。
+3. **坐标带分桶 + 区间冲突聚类 + 无交叉排序**：分别处理垂直与水平中间段；将相邻坐标差距 `<= max(1.5, 0.8 * nudge_distance)` 的近距线段并入同带，并按另一维区间重叠划分冲突簇；采用确定性 Minimal-Crossing 排序键（对 Z 型/U 型正反向自动选定不交叉序，并以 `NetKey` 打破平局）排定轨道次序。
+4. **安全净宽夹紧 + 逐线全局复验回滚**：通过 `SpatialGridIndex::Query` 找出同跨度左右/上下障碍物膨胀框及相邻拐点约束得到安全通道 `[free_min, free_max]`，按 `nudge_distance`（空间不足时按 `(free_max - free_min) / (M + 1)` 均分）分配新坐标；每条调整后走 `ValidateAndSimplifyRoute()` 全量碰撞与正交复验，若任一线冲突仅单线回滚，**100% 保留原有 `Valid` 合法率**。
+
+### 3.5 异步会话模型（`AsyncLocalRouter`）
 
 * **双副本状态隔离**：主线程（Owner）仅操作 `model_`，后台工作线程独享一份独立的 `LocalOrthogonalRouter` 副本，彻底避免读写锁竞争或工作线程触碰 UI 数据。
 * **拖动合并与代际丢弃**：高频拖动调用 `Move()` 时，同模块多次位移直接合并覆盖到 `edits_` 表并递增 `generation_`；后台计算完毕提交结果时，若结果所属代际已落后于当前最新位置，自动丢弃过期路径。
-* **视口与选区优先**：调用 `Prioritize(viewport, selection)` 后，后台队列优先处理当前选中块和可见区域内的连线。
+* **视口与选区优先**：调用 `Prioritize(viewport, selection)` 后，后台队列优先处理当前选中块和可见区域内的连线；单波次 `pending_` 清空时在 Owner 侧收口触发局部/全图 `ChannelNudger`。
 
 ## 4. 核心数据结构与配置参考
 
@@ -95,13 +113,14 @@ src/
 | `padding` | `250.0` | 初始局部路由窗口外扩边距，重试时按 $2^k$ 扩张 |
 | `buffer` | `8.0` | 连线与模块边界的最小避障缓冲净空（近距排版场景可适当调小至 `4.0 ~ 6.0`） |
 | `penalty` | `50.0` | 单次 90° 拐弯惩罚（越高越倾向少拐点） |
-| `nudge_distance` | `6.0` | 预留的微调间距参数 |
+| `nudge_distance` | `6.0` | `ChannelNudger` 通道内相邻平行线目标间距（像素） |
 | `retries` | `3` | 局部窗口增量补障最大重试次数 |
 | `budget` | `120` | 单次局部求解传入求解器的最大障碍物数量预算 |
 | `settle_nudge` | `false` | 松手时是否传递 `nudge = true` 给求解器 |
-| `fast_paths` | `true` | 是否启用旧折线平移/端点修补与 L/Z 轻量快路径 |
+| `fast_paths` | `true` | 是否启用旧折线整线平移、L/Z 轻量候选与端点修补快路径 |
 | `profile` | `false` | 是否记录 `Route::profile` 分项耗时（建图、搜索、查询、复验） |
 | `reroute_third_party_blocked` | `false` | **默认关闭**：关闭时移模块压到无关线不重算（允许穿模）；开启时维护线段索引并重算被挡第三方线 |
+| `enable_channel_nudging` | `true` | **默认开启**：是否启用局部通道等距分轨（支持 `set_enable_channel_nudging(bool)` 实时切换） |
 
 ### 4.3 路由结果状态 `Status` 与 `Outcome`
 
@@ -208,21 +227,24 @@ class CustomSolver final : public localroute::LocalRouteSolver {
 localroute::LocalOrthogonalRouter router(cfg, std::make_shared<CustomSolver>());
 ```
 
-## 6. 线程安全与工程接入注意事项
+## 6. 线程安全与 `qt_demo` 交互能力说明
 
 1. **同步对象线程契约**：`LocalOrthogonalRouter` 本身不是线程安全的；除其内部 `RouteAllParallel()` 冻结只读阶段外，禁止多线程并发读写同一实例。
-2. **异步拓扑变更规则**：`AsyncLocalRouter` 面向已建好拓扑的编辑会话；执行增删模块/连线等拓扑结构变更时，应先销毁旧会话（或从 `view()` 拷贝重建）再创建新会话。
-3. **GUI 渲染防瓶颈建议**：在 5,000～10,000 模块规模下，渲染层应参考 `qt_demo/canvas_widget.cc`，通过 `view().QueryBlocks(viewport)` 做模块视口裁剪、为每条连线缓存包围盒做 $O(1)$ 裁剪，并在低缩放倍率下启用合批绘制与 LOD，避免图形框架自身成为性能瓶颈。
+2. **异步拓扑变更规则**：`AsyncLocalRouter` 面向已建好拓扑的编辑会话；执行增删模块/连线等拓扑结构变更时，应先销毁旧会话（或 `Clone()` 重建后调用 `StartDirty()` / `StartAll()`）再创建新会话。
+3. **GUI 渲染与自由建模能力（`qt_demo`）**：
+   * 渲染层通过 `view().QueryBlocks(viewport)` 做模块视口裁剪、为每条连线缓存包围盒做 $O(1)$ 裁剪，并在低缩放倍率下启用合批绘制与 LOD。
+   * 支持从左侧**图元库（`LibraryWidget`）**拖拽 7 类预设模块到画布（或从 `0 模块 (空白画布)` 起步），右侧面板及右键菜单支持动态修改选中模块四向端口个数（`左/右 0~16`、`上/下 0~8`），并支持悬停端口拖拽手动连线与 `Del` 删除。
+   * 工具栏内置 `预设: B1-B2 10线平行对连` 与 `预设: B9/B3/B8 级联布线` 视觉验收场景，配合 `通道分轨 (Nudging)` 复选框可一键开关对比分轨效果。
 4. **近距模块缓冲**：若业务画布允许两个相连模块间距小于 `2 * cfg.buffer`（默认 `16 px`），建议将 `cfg.buffer` 调至 `4.0 ~ 6.0` 以减少缓冲框互叠导致的 `Status::kDisplayOnly` 退化。
 
-## 7. 万级规模实测性能基线（Release `-O3`）
+## 7. 万级规模实测性能基线（Release `-O3`，开启 `enable_channel_nudging = true`）
 
-以下为当前默认 `LazyHananAStarSolver` 在 10,000 模块 / 20,000 连线（seed 42，含 15% 超长跨度连线）下的实测参考数据（完整历史 `libavoid` 同台对照记录归档于 Git 标签 `v1-libavoid-baseline`）：
+以下为默认 `LazyHananAStarSolver` + `ChannelNudger` 在 10,000 模块 / 20,000 连线（seed 42，含 15% 超长跨度连线，Windows Clang + Ninja Release）下的实测数据（完整历史 `libavoid` 同台对照记录归档于 Git 标签 `v1-libavoid-baseline`）：
 
 | 场景（10,000 模块 / 20,000 连线） | 指标 | 实测表现 |
 | :--- | :--- | :--- |
-| 同步 4 线程全图冷启动 | 总耗时 / 合法率 | **2.06 s** / **99.53%**（19,906 Valid, 94 DisplayOnly, 0 Failed） |
-| 同步单模块拖拽（200 帧） | P50 / P99 | **0.025 ms** / **3.294 ms**（非关联线误提交 0） |
-| 同步 20 模块框选拖拽（200 帧） | P50 / P99 | **0.938 ms** / **2.318 ms** |
-| 同步穿插密集连线区（200 帧） | P50 / P99 | **0.348 ms** / **0.665 ms**（非关联线误提交 0） |
-| `qt_demo` Async 模式局部拖拽 | `Route Time` / `Paint Time` | **0.017 ~ 0.055 ms** / **8.8 ~ 11.2 ms**（稳定 60fps） |
+| 同步 4 线程全图冷启动 | 总耗时 / 合法率 | **2.34 s**（`2338.52 ms`） / **99.53%**（19,906 Valid, 94 DisplayOnly, 0 Failed） |
+| 同步单模块拖拽（200 帧） | P50 / P99 | **0.966 ms** / **4.347 ms**（非关联线误提交 0） |
+| 同步 20 模块框选拖拽（200 帧） | P50 / P99 | **1.904 ms** / **4.638 ms** |
+| 同步穿插密集连线区（200 帧） | P50 / P99 | **0.973 ms** / **2.821 ms**（非关联线误提交 0） |
+| `qt_demo` Async 10k 交互冒烟 | `Route Time` / `Paint Time` | **0.027 ~ 0.106 ms** / **5.02 ~ 6.84 ms** |

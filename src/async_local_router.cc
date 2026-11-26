@@ -119,9 +119,19 @@ void AsyncLocalRouter::set_reroute_third_party_blocked(bool enabled) {
   Refresh();
 }
 
+void AsyncLocalRouter::set_enable_channel_nudging(bool enabled) {
+  model_.set_enable_channel_nudging(enabled);
+  std::lock_guard<std::mutex> lock(mutex_);
+  has_nudging_update_ = true;
+  pending_enable_channel_nudging_ = enabled;
+  dirty_for_nudge_.clear();
+  Refresh();
+}
+
 std::size_t AsyncLocalRouter::Poll(std::size_t max_results,
                                    std::vector<Id>* updated_ids) {
   std::deque<std::pair<Id, Route>> batch;
+  bool wave_finished = false;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (failure_) {
@@ -136,13 +146,27 @@ std::size_t AsyncLocalRouter::Poll(std::size_t max_results,
       batch.push_back(std::move(ready_.front()));
       ready_.pop_front();
     }
+    wave_finished = pending_.empty() && ready_.empty();
   }
   wake_.notify_one();
   for (auto& entry : batch) {
     if (updated_ids) {
       updated_ids->push_back(entry.first);
     }
+    dirty_for_nudge_.insert(entry.first);
     model_.Publish(entry.first, std::move(entry.second));
+  }
+  if (wave_finished && model_.cfg_.enable_channel_nudging &&
+      !dirty_for_nudge_.empty()) {
+    const std::vector<Id> seeds(dirty_for_nudge_.begin(),
+                                dirty_for_nudge_.end());
+    dirty_for_nudge_.clear();
+    const bool full_graph = seeds.size() > 256;
+    const std::vector<Id> nudged =
+        model_.ApplyChannelNudging(seeds, full_graph);
+    if (updated_ids) {
+      updated_ids->insert(updated_ids->end(), nudged.begin(), nudged.end());
+    }
   }
   return batch.size();
 }
@@ -170,6 +194,11 @@ void AsyncLocalRouter::Run(LocalOrthogonalRouter snapshot) {
           snapshot.cfg_.reroute_third_party_blocked =
               pending_reroute_third_party_;
           has_config_update_ = false;
+        }
+        if (has_nudging_update_) {
+          snapshot.cfg_.enable_channel_nudging =
+              pending_enable_channel_nudging_;
+          has_nudging_update_ = false;
         }
         for (Id id : priority_) {
           if (pending_.count(id)) {

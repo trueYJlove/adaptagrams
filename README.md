@@ -1,5 +1,7 @@
 # Local Orthogonal Router (Simulink-Scale C++17 Routing Engine)
 
+> 权威架构、算法与 API 说明请参阅 **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**；协作与工程规范请参阅 **[AGENTS.md](AGENTS.md)**。
+
 零外部依赖的纯 C++17 万级局部正交布线引擎，支持 10,000 模块 / 20,000 连线规模下的亚毫秒级同步局部重算、异步非阻塞增量更新与实时 Qt 交互可视化演示。代码命名、文件命名与格式规范遵循 **Google C++ Style Guide**（仓库根目录已配置 `.clang-format`）。
 
 > 历史对照基线（包含 `adaptagrams/libavoid` 原生对比与三阶段同台压测记录）已归档于 Git 标签 `v1-libavoid-baseline`，可通过 `git checkout v1-libavoid-baseline` 查看。
@@ -9,10 +11,12 @@
 ```text
 .
 ├── .clang-format                      # Google C++ 代码格式化规范
+├── AGENTS.md                          # 仓库长期工程约束铁律
+├── CLAUDE.md                          # 指向 AGENTS.md 的兼容入口
 ├── CMakeLists.txt
 ├── README.md
-├── doc/
-│   └── architecture.md                # 架构设计与 API 接入说明
+├── docs/
+│   └── ARCHITECTURE.md                # 唯一权威文档：架构设计、算法与 API 接入说明
 ├── include/localroute/
 │   ├── local_route_solver.h           # 求解器抽象 LocalRouteSolver 与配置/几何类型
 │   ├── spatial_grid_index.h           # 2D 空间网格索引
@@ -21,14 +25,16 @@
 ├── src/
 │   ├── lazy_hanan_a_star_solver.cc    # 零堆链表、阻塞位图 + 两阶段正交 A* 求解器
 │   ├── local_orthogonal_router.cc     # 局部窗口查询、快速复用与全局碰撞复验
+│   ├── channel_nudger.h / .cc         # 局部通道防重叠等距分轨
 │   └── async_local_router.cc          # 后台工作线程与版本丢弃
 ├── tests/
 │   ├── topology_generator.h
-│   ├── local_router_test.cc           # 9 项核心单元与边界测试
+│   ├── local_router_test.cc           # 核心单元与边界测试
 │   ├── bench_large_scale.cc           # 1k / 3k / 5k / 10k 同步/异步/分项压测
 │   └── run_benchmark.py
 └── qt_demo/                           # 基于 Qt Widgets 视口裁剪 + LOD 的万级交互画布
     ├── CMakeLists.txt
+    ├── library_widget.h / .cc         # 可拖拽 Simulink 风格图元库浏览器
     ├── canvas_widget.h / .cc
     ├── main_window.h / .cc
     └── main.cc

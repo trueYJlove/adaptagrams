@@ -33,6 +33,7 @@ class LocalOrthogonalRouter {
   LocalOrthogonalRouter Clone() const { return *this; }
   std::vector<Point> Preview(Id id) const;
   void set_reroute_third_party_blocked(bool enabled);
+  void set_enable_channel_nudging(bool enabled);
 
   const Config& config() const { return cfg_; }
   std::vector<Id> QueryBlocks(Rect area) const { return index_.Query(area); }
@@ -57,8 +58,13 @@ class LocalOrthogonalRouter {
   void InvalidateObstacle(Id block_id, Rect rect);
   void ClearSegments(Id id);
   void Publish(Id id, Route route);
+  bool ValidateAndSimplifyRoute(const Conn& conn,
+                                std::vector<Point>* points) const;
+  std::vector<Id> ApplyChannelNudging(const std::vector<Id>& seed_conns,
+                                      bool full_graph);
 
   friend class AsyncLocalRouter;
+  friend class ChannelNudger;
 
   Config cfg_;
   SpatialGridIndex index_;

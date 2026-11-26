@@ -29,8 +29,11 @@ class CanvasWidget : public QWidget {
   ~CanvasWidget() override;
 
   void LoadTopology(unsigned block_count);
+  void LoadPresetParallelBundle();
+  void LoadPresetCascade();
   void SetRouteMode(RouteMode mode);
   void SetRerouteThirdPartyBlocked(bool enabled);
+  void SetEnableChannelNudging(bool enabled);
   void RouteAll();
   void FitAll();
   void ResetLocalView();
@@ -52,6 +55,7 @@ class CanvasWidget : public QWidget {
   unsigned conn_count() const { return current_conn_count_; }
   RouteMode route_mode() const { return mode_; }
   bool reroute_third_party_blocked() const { return third_party_reroute_; }
+  bool enable_channel_nudging() const { return channel_nudging_; }
   std::size_t selected_block_count() const { return selected_blocks_.size(); }
   bool has_selected_conn() const { return has_selected_conn_; }
   const localroute::LocalOrthogonalRouter& router_view() const {
@@ -105,6 +109,7 @@ class CanvasWidget : public QWidget {
   enum class DragKind { kNone, kPan, kMoveBlocks, kRubberBand, kWiring };
 
   const localroute::LocalOrthogonalRouter& ActiveView() const;
+  void InstallInitialRouter(localroute::LocalOrthogonalRouter initial);
   void ApplyModelEdit(const std::function<std::vector<localroute::Id>(
                           localroute::LocalOrthogonalRouter*)>& edit_fn);
   void RefreshWorldBounds();
@@ -124,6 +129,7 @@ class CanvasWidget : public QWidget {
 
   RouteMode mode_ = RouteMode::kAsync;
   bool third_party_reroute_ = false;
+  bool channel_nudging_ = true;
   unsigned current_block_count_ = 0;
   unsigned current_conn_count_ = 0;
   localroute::Id next_block_id_ = 1;

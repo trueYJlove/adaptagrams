@@ -33,6 +33,7 @@ class AsyncLocalRouter {
   void Prioritize(Rect viewport, const std::vector<Id>& selection = {});
   void Settle();
   void set_reroute_third_party_blocked(bool enabled);
+  void set_enable_channel_nudging(bool enabled);
   std::size_t Poll(std::size_t max_results = 64,
                    std::vector<Id>* updated_ids = nullptr);
   std::size_t PendingCount();
@@ -56,6 +57,9 @@ class AsyncLocalRouter {
   bool stopped_ = false;
   bool has_config_update_ = false;
   bool pending_reroute_third_party_ = false;
+  bool has_nudging_update_ = false;
+  bool pending_enable_channel_nudging_ = true;
+  std::set<Id> dirty_for_nudge_;
   std::exception_ptr failure_;
   std::thread worker_;
 };

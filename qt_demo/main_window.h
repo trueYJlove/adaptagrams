@@ -23,6 +23,7 @@ class MainWindow : public QMainWindow {
   void OnScaleChanged(int index);
   void OnModeChanged(int index);
   void OnThirdPartyToggled(bool checked);
+  void OnChannelNudgingToggled(bool checked);
   void OnClearCanvas();
   void OnPortSpinChanged();
   void SyncInspectorFromSelection();
@@ -36,6 +37,7 @@ class MainWindow : public QMainWindow {
   QComboBox* scale_combo_ = nullptr;
   QComboBox* mode_combo_ = nullptr;
   QCheckBox* third_party_check_ = nullptr;
+  QCheckBox* nudging_check_ = nullptr;
 
   // Inspector controls
   QLabel* sel_title_label_ = nullptr;

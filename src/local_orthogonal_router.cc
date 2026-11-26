@@ -13,6 +13,8 @@
 #include <tuple>
 #include <utility>
 
+#include "channel_nudger.h"
+
 namespace localroute {
 namespace {
 
@@ -216,6 +218,70 @@ void LocalOrthogonalRouter::set_reroute_third_party_blocked(bool enabled) {
   }
 }
 
+void LocalOrthogonalRouter::set_enable_channel_nudging(bool enabled) {
+  cfg_.enable_channel_nudging = enabled;
+}
+
+std::vector<Id> LocalOrthogonalRouter::ApplyChannelNudging(
+    const std::vector<Id>& seed_conns, bool full_graph) {
+  return ChannelNudger::Nudge(this, seed_conns, full_graph);
+}
+
+bool LocalOrthogonalRouter::ValidateAndSimplifyRoute(
+    const Conn& c, std::vector<Point>* points) const {
+  if (!points) {
+    return false;
+  }
+  const auto& src = blocks_.at(c.src);
+  const auto& dst = blocks_.at(c.dst);
+  const Pin sp = FindPin(src, c.sp);
+  const Pin dp = FindPin(dst, c.dp);
+  const Point a = PinPosition(src.rect, sp);
+  const Point b = PinPosition(dst.rect, dp);
+  const Rect aa = src.rect.Pad(cfg_.buffer);
+  const Rect bb = dst.rect.Pad(cfg_.buffer);
+
+  auto& p = *points;
+  if (!std::all_of(p.begin(), p.end(), FinitePoint)) {
+    return false;
+  }
+  p.erase(std::unique(p.begin(), p.end()), p.end());
+  size_t count = 0;
+  for (const Point v : p) {
+    if (count >= 2 &&
+        OrthoDir(p[count - 2], p[count - 1]) == OrthoDir(p[count - 1], v)) {
+      --count;
+    }
+    p[count++] = v;
+  }
+  p.resize(count);
+
+  if (p.size() < 2 || !(p.front() == a && p.back() == b) ||
+      !(OrthoDir(a, p[1]) & sp.dirs) ||
+      !(OrthoDir(b, p[p.size() - 2]) & dp.dirs)) {
+    return false;
+  }
+  for (size_t j = 1; j < p.size(); ++j) {
+    const Point u = p[j - 1];
+    const Point v = p[j];
+    if (!OrthoDir(u, v)) {
+      return false;
+    }
+    for (Id id : index_.Query(Box(u, v).Pad(cfg_.buffer))) {
+      const Rect rect = blocks_.at(id).rect.Pad(cfg_.buffer);
+      if (!Crosses(u, v, rect)) {
+        continue;
+      }
+      if ((id == c.src && j == 1 && CanExit(u, v, src.rect, aa)) ||
+          (id == c.dst && j + 1 == p.size() && CanExit(v, u, dst.rect, bb))) {
+        continue;
+      }
+      return false;
+    }
+  }
+  return true;
+}
+
 std::vector<Point> LocalOrthogonalRouter::Preview(Id id) const {
   const auto& c = conns_.at(id);
   const auto& a = blocks_.at(c.src);
@@ -373,7 +439,10 @@ Route LocalOrthogonalRouter::SolveOne(const Conn& c, bool settled) const {
 
   if (cfg_.fast_paths && !(settled && cfg_.settle_nudge)) {
     const auto it = routes_.find(c.id);
-    if (it != routes_.end() && it->second.method != RouteMethod::kNone) {
+    const bool has_old =
+        it != routes_.end() && it->second.method != RouteMethod::kNone;
+    // 1. Whole-polyline translation reuse.
+    if (has_old) {
       const auto& p = it->second.points;
       const double dx = a.x - p.front().x;
       const double dy = a.y - p.front().y;
@@ -388,27 +457,8 @@ Route LocalOrthogonalRouter::SolveOne(const Conn& c, bool settled) const {
           return out;
         }
       }
-      if (p.size() >= 3) {
-        auto repair = [&](Point end, Point old_end, Point bend) {
-          return end == old_end ? bend
-                                : (old_end.y == bend.y ? Point{bend.x, end.y}
-                                                       : Point{end.x, bend.y});
-        };
-        const Point first = repair(a, p.front(), p[1]);
-        const Point last = repair(b, p.back(), p[p.size() - 2]);
-        std::vector<Point> patch{a, first};
-        if (p.size() == 3) {
-          patch.push_back(p[1]);
-        } else {
-          patch.insert(patch.end(), p.begin() + 2, p.end() - 2);
-        }
-        patch.push_back(last);
-        patch.push_back(b);
-        if (accept(std::move(patch), RouteMethod::kReuse)) {
-          return out;
-        }
-      }
     }
+    // 2. Clean 2/3-segment L and Z Simple candidates (eliminates stale hooks).
     if (accept(Elbow(a, b, true), RouteMethod::kSimple) ||
         (a.x != b.x && a.y != b.y &&
          accept(Elbow(a, b, false), RouteMethod::kSimple))) {
@@ -429,6 +479,31 @@ Route LocalOrthogonalRouter::SolveOne(const Conn& c, bool settled) const {
            {(a.y + b.y) * 0.5, std::clamp((a.y + b.y) * 0.5, aa.t, aa.b),
             std::clamp((a.y + b.y) * 0.5, bb.t, bb.b)}) {
         if (accept({a, {a.x, y}, {b.x, y}, b}, RouteMethod::kSimple)) {
+          return out;
+        }
+      }
+    }
+    // 3. Fallback: patch endpoints onto previous middle segments when Simple is
+    //    blocked by obstacles.
+    if (has_old) {
+      const auto& p = it->second.points;
+      if (p.size() >= 3) {
+        auto repair = [&](Point end, Point old_end, Point bend) {
+          return end == old_end ? bend
+                                : (old_end.y == bend.y ? Point{bend.x, end.y}
+                                                       : Point{end.x, bend.y});
+        };
+        const Point first = repair(a, p.front(), p[1]);
+        const Point last = repair(b, p.back(), p[p.size() - 2]);
+        std::vector<Point> patch{a, first};
+        if (p.size() == 3) {
+          patch.push_back(p[1]);
+        } else {
+          patch.insert(patch.end(), p.begin() + 2, p.end() - 2);
+        }
+        patch.push_back(last);
+        patch.push_back(b);
+        if (accept(std::move(patch), RouteMethod::kReuse)) {
           return out;
         }
       }
@@ -506,11 +581,19 @@ std::vector<Id> LocalOrthogonalRouter::RerouteAffected(
   for (Id id : ids) {
     Publish(id, SolveOne(conns_.at(id), settled));
   }
+  if (cfg_.enable_channel_nudging && !ids.empty()) {
+    const std::vector<Id> nudged =
+        ApplyChannelNudging({ids.begin(), ids.end()}, false);
+    ids.insert(nudged.begin(), nudged.end());
+  }
   return {ids.begin(), ids.end()};
 }
 
 void LocalOrthogonalRouter::RouteConnector(Id id) {
   Publish(id, SolveOne(conns_.at(id), false));
+  if (cfg_.enable_channel_nudging) {
+    (void)ApplyChannelNudging({id}, false);
+  }
 }
 
 void LocalOrthogonalRouter::MarkConnector(Id id) {
@@ -552,6 +635,9 @@ void LocalOrthogonalRouter::RouteAllParallel(unsigned threads) {
   }
   for (size_t i = 0; i < ids.size(); ++i) {
     Publish(ids[i], std::move(result[i]));
+  }
+  if (cfg_.enable_channel_nudging) {
+    (void)ApplyChannelNudging({}, true);
   }
 }
 

@@ -17,3 +17,5 @@ __pycache__/
 .vscode/
 .idea/
 *.user
+phase*_plan.md
+*_review.md

@@ -363,6 +363,133 @@ void TestBoundaryCases() {
   }
 }
 
+bool SegmentsProperlyCross(Point a0, Point a1, Point b0, Point b1) {
+  const bool a_vert = (a0.x == a1.x);
+  const bool b_vert = (b0.x == b1.x);
+  if (a_vert == b_vert) {
+    return false;
+  }
+  const Point h0 = a_vert ? b0 : a0;
+  const Point h1 = a_vert ? b1 : a1;
+  const Point v0 = a_vert ? a0 : b0;
+  const Point v1 = a_vert ? a1 : b1;
+  const double hx_min = std::min(h0.x, h1.x);
+  const double hx_max = std::max(h0.x, h1.x);
+  const double vy_min = std::min(v0.y, v1.y);
+  const double vy_max = std::max(v0.y, v1.y);
+  return v0.x > hx_min + 1e-6 && v0.x < hx_max - 1e-6 && h0.y > vy_min + 1e-6 &&
+         h0.y < vy_max - 1e-6;
+}
+
+void TestChannelNudgingParallelBundle() {
+  Config cfg;
+  cfg.nudge_distance = 6.0;
+  cfg.enable_channel_nudging = true;
+  LocalOrthogonalRouter r(cfg);
+
+  std::vector<Pin> b1_pins;
+  std::vector<Pin> b2_pins;
+  for (Id i = 0; i < 10; ++i) {
+    const double y = static_cast<double>(i + 1) / 11.0;
+    b1_pins.push_back({100 + i, 1.0, y, kRight});
+    b2_pins.push_back({200 + i, 0.0, y, kLeft});
+  }
+  r.AddBlock({1, {0.0, 0.0, 80.0, 260.0}, b1_pins});
+  r.AddBlock({2, {340.0, 60.0, 420.0, 320.0}, b2_pins});
+  for (Id i = 0; i < 10; ++i) {
+    r.AddConnector({100 + i, 1, 100 + i, 2, 200 + i});
+  }
+
+  r.RouteAllParallel(1);
+
+  std::vector<double> mid_xs;
+  for (Id i = 0; i < 10; ++i) {
+    const Route& rt = r.route(100 + i);
+    CHECK(rt.status == Status::kValid);
+    CHECK(rt.points.size() == 4);
+    mid_xs.push_back(rt.points[1].x);
+  }
+  std::sort(mid_xs.begin(), mid_xs.end());
+  for (std::size_t i = 1; i < mid_xs.size(); ++i) {
+    CHECK(mid_xs[i] - mid_xs[i - 1] >= 4.0);
+  }
+  for (Id i = 0; i < 10; ++i) {
+    const auto& pa = r.route(100 + i).points;
+    for (Id j = i + 1; j < 10; ++j) {
+      const auto& pb = r.route(100 + j).points;
+      for (std::size_t sa = 1; sa < pa.size(); ++sa) {
+        for (std::size_t sb = 1; sb < pb.size(); ++sb) {
+          CHECK(!SegmentsProperlyCross(pa[sa - 1], pa[sa], pb[sb - 1], pb[sb]));
+        }
+      }
+    }
+  }
+}
+
+void TestChannelNudgingCascadeAndNoHook() {
+  Config cfg;
+  cfg.nudge_distance = 6.0;
+  cfg.enable_channel_nudging = true;
+  LocalOrthogonalRouter r(cfg);
+
+  // Start B9 to the right of B10 so its initial route wraps around with >= 4
+  // bends (6+ points), then drag B9 back to the left column to ensure Simple
+  // snaps the hook away immediately.
+  r.AddBlock({9, {300.0, 0.0, 390.0, 50.0}, {{1, 1.0, 0.5, kRight}}});
+  r.AddBlock({3, {0.0, 80.0, 90.0, 130.0}, {{1, 1.0, 0.5, kRight}}});
+  r.AddBlock({8, {0.0, 160.0, 90.0, 210.0}, {{1, 1.0, 0.5, kRight}}});
+  r.AddBlock({10,
+              {270.0, 150.0, 360.0, 230.0},
+              {{1, 0.0, 0.33, kLeft}, {2, 0.0, 0.67, kLeft}}});
+  r.AddBlock({11, {270.0, 240.0, 360.0, 290.0}, {{1, 0.0, 0.5, kLeft}}});
+  r.AddBlock({12, {270.0, 320.0, 360.0, 370.0}, {{1, 0.0, 0.5, kLeft}}});
+
+  r.AddConnector({1, 9, 1, 10, 1});
+  r.AddConnector({2, 3, 1, 10, 2});
+  r.AddConnector({3, 8, 1, 11, 1});
+  r.AddConnector({4, 8, 1, 12, 1});  // Shares NetKey(8, 1) with conn 3.
+
+  r.RouteAllParallel(1);
+  CHECK(r.route(1).status == Status::kValid);
+  CHECK(r.route(1).points.size() >= 6);  // Wrapped around from right side.
+
+  // Drag B9 left into the source column: Simple Z must eliminate the stale
+  // hook (<= 4 points) and ChannelNudger must separate B9, B3, B8 cleanly.
+  r.MoveBlock(9, -300.0, 0.0);
+  (void)r.RerouteAffected({9});
+
+  for (Id cid : {1u, 2u, 3u, 4u}) {
+    const Route& rt = r.route(cid);
+    CHECK(rt.status == Status::kValid);
+    CHECK(rt.points.size() <= 4);  // At most 2 bends (no 4-bend hook).
+  }
+
+  // Same-source fan-out (3 and 4) must keep sharing their middle trunk.
+  CHECK(std::abs(r.route(3).points[1].x - r.route(4).points[1].x) < 1e-6);
+
+  // Three distinct nets (B9, B3, B8) must be separated >= 4px without crossing.
+  std::vector<double> xs{r.route(1).points[1].x, r.route(2).points[1].x,
+                         r.route(3).points[1].x};
+  std::sort(xs.begin(), xs.end());
+  CHECK(xs[1] - xs[0] >= 4.0);
+  CHECK(xs[2] - xs[1] >= 4.0);
+
+  for (Id a : {1u, 2u, 3u}) {
+    const auto& pa = r.route(a).points;
+    for (Id b : {1u, 2u, 3u}) {
+      if (a >= b) {
+        continue;
+      }
+      const auto& pb = r.route(b).points;
+      for (std::size_t sa = 1; sa < pa.size(); ++sa) {
+        for (std::size_t sb = 1; sb < pb.size(); ++sb) {
+          CHECK(!SegmentsProperlyCross(pa[sa - 1], pa[sa], pb[sb - 1], pb[sb]));
+        }
+      }
+    }
+  }
+}
+
 }  // namespace
 }  // namespace localroute
 
@@ -377,6 +504,10 @@ int main(int argc, char** argv) {
       {"FastReuseAndThirdPartyObstruction", localroute::TestFastAndObstruction},
       {"AsyncDiscardsStaleResults", localroute::TestAsyncRouting},
       {"LazyHananAStarBoundaryCases", localroute::TestBoundaryCases},
+      {"ChannelNudgingParallelBundle",
+       localroute::TestChannelNudgingParallelBundle},
+      {"ChannelNudgingCascadeAndNoHook",
+       localroute::TestChannelNudgingCascadeAndNoHook},
   };
   try {
     for (const auto& t : kCases) {

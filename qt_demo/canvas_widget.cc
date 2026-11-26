@@ -210,37 +210,8 @@ void CanvasWidget::ApplyModelEdit(
   emit SelectionChanged();
 }
 
-void CanvasWidget::LoadTopology(unsigned block_count) {
-  async_timer_.stop();
-  async_router_.reset();
-  sync_router_.reset();
-  selected_blocks_.clear();
-  highlighted_conns_.clear();
-  has_selected_conn_ = false;
-  selected_conn_id_ = 0;
-  hover_pin_ = PinHit{};
-  wire_src_ = PinHit{};
-  route_samples_ms_.clear();
-  drag_kind_ = DragKind::kNone;
-
-  localroute::Config cfg;
-  cfg.reroute_third_party_blocked = third_party_reroute_;
-  localroute::LocalOrthogonalRouter initial(cfg);
-
-  next_block_id_ = 1;
-  next_conn_id_ = 1;
-  if (block_count > 0) {
-    const localroute::Topology top = localroute::GenerateTopology(block_count);
-    for (const auto& b : top.blocks) {
-      initial.AddBlock(b);
-      next_block_id_ = std::max(next_block_id_, b.id + 1);
-    }
-    for (const auto& c : top.conns) {
-      initial.AddConnector(c);
-      next_conn_id_ = std::max(next_conn_id_, c.id + 1);
-    }
-  }
-
+void CanvasWidget::InstallInitialRouter(
+    localroute::LocalOrthogonalRouter initial) {
   current_block_count_ = static_cast<unsigned>(initial.all_blocks().size());
   current_conn_count_ = static_cast<unsigned>(initial.all_conns().size());
 
@@ -258,7 +229,16 @@ void CanvasWidget::LoadTopology(unsigned block_count) {
 
   RefreshWorldBounds();
   RebuildRouteCache();
-  ResetLocalView();
+  if (current_block_count_ > 0 && current_block_count_ <= 32) {
+    zoom_ = 1.0;
+    const double cx = (world_bounds_.l + world_bounds_.r) * 0.5;
+    const double cy = (world_bounds_.t + world_bounds_.b) * 0.5;
+    pan_offset_ =
+        QPointF(width() * 0.5 - cx * zoom_, height() * 0.5 - cy * zoom_);
+    UpdateViewportPriority();
+  } else {
+    ResetLocalView();
+  }
 
   if (mode_ == RouteMode::kAsync && async_router_) {
     QElapsedTimer start_timer;
@@ -279,6 +259,106 @@ void CanvasWidget::LoadTopology(unsigned block_count) {
   emit SelectionChanged();
 }
 
+void CanvasWidget::LoadTopology(unsigned block_count) {
+  async_timer_.stop();
+  async_router_.reset();
+  sync_router_.reset();
+  selected_blocks_.clear();
+  highlighted_conns_.clear();
+  has_selected_conn_ = false;
+  selected_conn_id_ = 0;
+  hover_pin_ = PinHit{};
+  wire_src_ = PinHit{};
+  route_samples_ms_.clear();
+  drag_kind_ = DragKind::kNone;
+
+  localroute::Config cfg;
+  cfg.reroute_third_party_blocked = third_party_reroute_;
+  cfg.enable_channel_nudging = channel_nudging_;
+  localroute::LocalOrthogonalRouter initial(cfg);
+
+  next_block_id_ = 1;
+  next_conn_id_ = 1;
+  if (block_count > 0) {
+    const localroute::Topology top = localroute::GenerateTopology(block_count);
+    for (const auto& b : top.blocks) {
+      initial.AddBlock(b);
+      next_block_id_ = std::max(next_block_id_, b.id + 1);
+    }
+    for (const auto& c : top.conns) {
+      initial.AddConnector(c);
+      next_conn_id_ = std::max(next_conn_id_, c.id + 1);
+    }
+  }
+  InstallInitialRouter(std::move(initial));
+}
+
+void CanvasWidget::LoadPresetParallelBundle() {
+  LoadTopology(0);
+  async_timer_.stop();
+  async_router_.reset();
+  sync_router_.reset();
+
+  localroute::Config cfg;
+  cfg.reroute_third_party_blocked = third_party_reroute_;
+  cfg.enable_channel_nudging = channel_nudging_;
+  localroute::LocalOrthogonalRouter initial(cfg);
+
+  std::vector<localroute::Pin> b1_pins;
+  std::vector<localroute::Pin> b2_pins;
+  for (int i = 0; i < 10; ++i) {
+    const double y = static_cast<double>(i + 1) / 11.0;
+    b1_pins.push_back(
+        {static_cast<localroute::Id>(200 + i), 1.0, y, localroute::kRight});
+    b2_pins.push_back(
+        {static_cast<localroute::Id>(100 + i), 0.0, y, localroute::kLeft});
+  }
+  initial.AddBlock({1, {0.0, 0.0, 90.0, 260.0}, b1_pins});
+  initial.AddBlock({2, {350.0, 60.0, 440.0, 320.0}, b2_pins});
+  for (int i = 0; i < 10; ++i) {
+    initial.AddConnector({static_cast<localroute::Id>(1 + i), 1,
+                          static_cast<localroute::Id>(200 + i), 2,
+                          static_cast<localroute::Id>(100 + i)});
+  }
+  next_block_id_ = 3;
+  next_conn_id_ = 11;
+  InstallInitialRouter(std::move(initial));
+}
+
+void CanvasWidget::LoadPresetCascade() {
+  LoadTopology(0);
+  async_timer_.stop();
+  async_router_.reset();
+  sync_router_.reset();
+
+  localroute::Config cfg;
+  cfg.reroute_third_party_blocked = third_party_reroute_;
+  cfg.enable_channel_nudging = channel_nudging_;
+  localroute::LocalOrthogonalRouter initial(cfg);
+
+  initial.AddBlock(
+      {9, {0.0, 0.0, 90.0, 50.0}, {{200, 1.0, 0.5, localroute::kRight}}});
+  initial.AddBlock(
+      {3, {0.0, 80.0, 90.0, 130.0}, {{200, 1.0, 0.5, localroute::kRight}}});
+  initial.AddBlock(
+      {8, {0.0, 160.0, 90.0, 210.0}, {{200, 1.0, 0.5, localroute::kRight}}});
+  initial.AddBlock({10,
+                    {270.0, 150.0, 360.0, 230.0},
+                    {{100, 0.0, 0.33, localroute::kLeft},
+                     {101, 0.0, 0.67, localroute::kLeft}}});
+  initial.AddBlock(
+      {11, {270.0, 240.0, 360.0, 290.0}, {{100, 0.0, 0.5, localroute::kLeft}}});
+  initial.AddBlock(
+      {12, {270.0, 320.0, 360.0, 370.0}, {{100, 0.0, 0.5, localroute::kLeft}}});
+  initial.AddConnector({1, 9, 200, 10, 100});
+  initial.AddConnector({2, 3, 200, 10, 101});
+  initial.AddConnector({3, 8, 200, 11, 100});
+  initial.AddConnector({4, 8, 200, 12, 100});
+  next_block_id_ = 13;
+  next_conn_id_ = 5;
+  InstallInitialRouter(std::move(initial));
+}
+
 void CanvasWidget::SetRouteMode(RouteMode new_mode) {
   if (mode_ == new_mode) {
     return;
@@ -286,6 +366,7 @@ void CanvasWidget::SetRouteMode(RouteMode new_mode) {
   async_timer_.stop();
   localroute::LocalOrthogonalRouter model = ActiveView().Clone();
   model.set_reroute_third_party_blocked(third_party_reroute_);
+  model.set_enable_channel_nudging(channel_nudging_);
   async_router_.reset();
   sync_router_.reset();
   mode_ = new_mode;
@@ -326,6 +407,64 @@ void CanvasWidget::SetRerouteThirdPartyBlocked(bool enabled) {
   }
   update();
   emit StatusChanged();
+}
+
+void CanvasWidget::SetEnableChannelNudging(bool enabled) {
+  if (channel_nudging_ == enabled) {
+    return;
+  }
+  channel_nudging_ = enabled;
+  if (!enabled) {
+    // Rebuild from empty routes so previously nudged middle segments do not
+    // persist via zero-displacement translation reuse.
+    async_timer_.stop();
+    const auto& cur = ActiveView();
+    localroute::Config cfg = cur.config();
+    cfg.reroute_third_party_blocked = third_party_reroute_;
+    cfg.enable_channel_nudging = false;
+    localroute::LocalOrthogonalRouter fresh(cfg);
+    for (const auto& kv : cur.all_blocks()) {
+      fresh.AddBlock(kv.second);
+    }
+    for (const auto& kv : cur.all_conns()) {
+      fresh.AddConnector(kv.second);
+    }
+    async_router_.reset();
+    sync_router_.reset();
+
+    QElapsedTimer timer;
+    timer.start();
+    if (mode_ == RouteMode::kSync) {
+      sync_router_ =
+          std::make_unique<localroute::LocalOrthogonalRouter>(std::move(fresh));
+      sync_router_->RouteAllParallel();
+      route_time_ms_ = static_cast<double>(timer.nsecsElapsed()) / 1e6;
+    } else {
+      async_router_ =
+          std::make_unique<localroute::AsyncLocalRouter>(std::move(fresh));
+      async_router_->Prioritize(
+          WorldViewportRect(),
+          std::vector<localroute::Id>(selected_blocks_.begin(),
+                                      selected_blocks_.end()));
+      async_router_->StartAll();
+      route_time_ms_ = static_cast<double>(timer.nsecsElapsed()) / 1e6;
+      if (async_router_->PendingCount() > 0) {
+        async_timer_.start();
+      }
+    }
+    RecordRouteSample(route_time_ms_);
+    RebuildRouteCache();
+    update();
+    emit StatusChanged();
+    return;
+  }
+
+  if (mode_ == RouteMode::kSync && sync_router_) {
+    sync_router_->set_enable_channel_nudging(true);
+  } else if (mode_ == RouteMode::kAsync && async_router_) {
+    async_router_->set_enable_channel_nudging(true);
+  }
+  RouteAll();
 }
 
 void CanvasWidget::RouteAll() {
@@ -1649,7 +1788,7 @@ void CanvasWidget::DrawHud(QPainter* painter) {
   painter->save();
   painter->setRenderHint(QPainter::Antialiasing, true);
 
-  const QRectF hud_rect(12, 12, 370, 152);
+  const QRectF hud_rect(12, 12, 420, 152);
   painter->setPen(QPen(QColor(45, 58, 76, 180), 1.0));
   painter->setBrush(QColor(18, 24, 34, 210));
   painter->drawRoundedRect(hud_rect, 8.0, 8.0);
@@ -1663,13 +1802,15 @@ void CanvasWidget::DrawHud(QPainter* painter) {
 
   const char* mode_str = (mode_ == RouteMode::kAsync) ? "Async" : "Sync";
   const char* reroute_str = third_party_reroute_ ? "ON" : "OFF";
+  const char* nudge_str = channel_nudging_ ? "ON" : "OFF";
   const QString lines[6] = {
       QString("Scale       : %1 blocks / %2 conns")
           .arg(current_block_count_)
           .arg(current_conn_count_),
-      QString("Mode        : %1 | ThirdPartyReroute: %2")
+      QString("Mode        : %1 | 3rdParty: %2 | Nudge: %3")
           .arg(mode_str)
-          .arg(reroute_str),
+          .arg(reroute_str)
+          .arg(nudge_str),
       QString("FPS / Zoom  : %1 fps | %2x")
           .arg(current_fps_, 0, 'f', 1)
           .arg(zoom_, 0, 'f', 2),

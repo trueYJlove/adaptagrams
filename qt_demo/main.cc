@@ -1,6 +1,8 @@
 #include <QApplication>
 #include <QPixmap>
+#include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
@@ -93,6 +95,61 @@ int main(int argc, char* argv[]) {
       r2.status != localroute::Status::kValid || r2.points.size() < 4) {
     throw std::runtime_error("interactive modeling smoke check failed");
   }
+  const std::size_t cw1 = r1.points.size();
+  const std::size_t cw2 = r2.points.size();
+
+  // Verify Preset 1: B1-B2 10-wire staggered parallel bundle nudging.
+  canvas->LoadPresetParallelBundle();
+  canvas->render(&scratch);
+  std::vector<double> bundle_xs;
+  for (localroute::Id cid = 1; cid <= 10; ++cid) {
+    const auto& rt = canvas->router_view().route(cid);
+    if (rt.status != localroute::Status::kValid || rt.points.size() != 4) {
+      throw std::runtime_error("preset parallel bundle smoke check failed");
+    }
+    bundle_xs.push_back(rt.points[1].x);
+  }
+  std::sort(bundle_xs.begin(), bundle_xs.end());
+  double bundle_min_gap = 1e9;
+  for (std::size_t i = 1; i < bundle_xs.size(); ++i) {
+    bundle_min_gap = std::min(bundle_min_gap, bundle_xs[i] - bundle_xs[i - 1]);
+  }
+  if (bundle_min_gap < 4.0) {
+    throw std::runtime_error("preset parallel bundle min gap < 4px");
+  }
+
+  // Verify Preset 2: B9/B3/B8 cascade routing + live toggle off/on.
+  canvas->LoadPresetCascade();
+  canvas->render(&scratch);
+  std::vector<double> cascade_xs;
+  for (localroute::Id cid = 1; cid <= 4; ++cid) {
+    const auto& rt = canvas->router_view().route(cid);
+    if (rt.status != localroute::Status::kValid || rt.points.size() > 4) {
+      throw std::runtime_error("preset cascade smoke check failed");
+    }
+    if (cid <= 3) {
+      cascade_xs.push_back(rt.points[1].x);
+    }
+  }
+  if (std::abs(canvas->router_view().route(3).points[1].x -
+               canvas->router_view().route(4).points[1].x) > 1e-6) {
+    throw std::runtime_error("preset cascade fan-out trunk split unexpectedly");
+  }
+  std::sort(cascade_xs.begin(), cascade_xs.end());
+  const double cascade_min_gap =
+      std::min(cascade_xs[1] - cascade_xs[0], cascade_xs[2] - cascade_xs[1]);
+  if (cascade_min_gap < 4.0) {
+    throw std::runtime_error("preset cascade min gap < 4px");
+  }
+  canvas->SetEnableChannelNudging(false);
+  canvas->render(&scratch);
+  const double off_gap = std::abs(canvas->router_view().route(1).points[1].x -
+                                  canvas->router_view().route(2).points[1].x);
+  if (off_gap > 1e-6) {
+    throw std::runtime_error("preset cascade off toggle failed");
+  }
+  canvas->SetEnableChannelNudging(true);
+  canvas->render(&scratch);
 
   std::cout << "SMOKE_PASS" << " async_cold_route_ms=" << async_cold_route_ms
             << " async_cold_paint_ms=" << async_cold_paint_ms
@@ -109,8 +166,10 @@ int main(int argc, char* argv[]) {
             << " sync_box20_paint_ms=" << sync_box20_paint_ms
             << " fit_all_paint_ms=" << fit_all_paint_ms
             << " fit_vis=" << fit_vis_blocks << "/" << fit_vis_conns
-            << " custom_wire1_pts=" << r1.points.size()
-            << " custom_wire2_pts=" << r2.points.size() << std::endl;
+            << " custom_wire1_pts=" << cw1 << " custom_wire2_pts=" << cw2
+            << " preset_bundle_min_gap=" << bundle_min_gap
+            << " preset_cascade_min_gap=" << cascade_min_gap
+            << " preset_cascade_off_gap=" << off_gap << std::endl;
 
   return 0;
 }
