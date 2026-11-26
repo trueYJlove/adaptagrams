@@ -82,6 +82,7 @@ struct Config {
   bool profile = false;
   bool reroute_third_party_blocked = false;
   bool enable_channel_nudging = true;
+  double wire_overlap_penalty = 25.0;
 };
 
 enum class Status { kValid, kDisplayOnly, kFailed, kPending };
@@ -118,7 +119,15 @@ struct Route {
   Outcome outcome = Outcome::kNone;
   // Pending routes may retain previously validated points and method for reuse.
   RouteMethod method = RouteMethod::kNone;
+  bool user_modified = false;
   Profile profile;
+};
+
+struct OccupiedSegment {
+  Point u;
+  Point v;
+  Id src_block = 0;
+  Id src_pin = 0;
 };
 
 struct Request {
@@ -127,6 +136,7 @@ struct Request {
   const std::vector<const Block*>& obstacles;
   bool nudge = false;
   Profile* profile = nullptr;
+  const std::vector<OccupiedSegment>* occupied_wires = nullptr;
 };
 
 class LocalRouteSolver {

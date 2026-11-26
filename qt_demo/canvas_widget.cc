@@ -269,6 +269,9 @@ void CanvasWidget::LoadTopology(unsigned block_count) {
   selected_conn_id_ = 0;
   hover_pin_ = PinHit{};
   wire_src_ = PinHit{};
+  active_guides_.clear();
+  drag_seg_conn_id_ = 0;
+  drag_seg_index_ = 0;
   route_samples_ms_.clear();
   drag_kind_ = DragKind::kNone;
 
@@ -473,6 +476,47 @@ void CanvasWidget::SetHighlightFallback(bool enabled) {
   }
   highlight_fallback_ = enabled;
   update();
+}
+
+void CanvasWidget::SetShowLineHops(bool enabled) {
+  if (show_line_hops_ == enabled) {
+    return;
+  }
+  show_line_hops_ = enabled;
+  update();
+}
+
+std::vector<localroute::Id> CanvasWidget::AutoRouteSelection() {
+  std::vector<localroute::Id> targets;
+  const auto& view = ActiveView();
+  if (has_selected_conn_ && view.all_conns().count(selected_conn_id_)) {
+    targets.push_back(selected_conn_id_);
+  }
+  for (localroute::Id bid : selected_blocks_) {
+    for (localroute::Id cid : view.adjacent_conns(bid)) {
+      targets.push_back(cid);
+    }
+  }
+  if (targets.empty()) {
+    return {};
+  }
+  std::sort(targets.begin(), targets.end());
+  targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+
+  QElapsedTimer timer;
+  timer.start();
+  std::vector<localroute::Id> changed;
+  if (mode_ == RouteMode::kSync && sync_router_) {
+    changed = sync_router_->AutoRouteConnectors(targets);
+  } else if (mode_ == RouteMode::kAsync && async_router_) {
+    changed = async_router_->AutoRouteConnectors(targets);
+  }
+  route_time_ms_ = static_cast<double>(timer.nsecsElapsed()) / 1e6;
+  RecordRouteSample(route_time_ms_);
+  UpdateRouteCacheForIds(changed);
+  update();
+  emit StatusChanged();
+  return changed;
 }
 
 void CanvasWidget::RouteAll() {
@@ -996,6 +1040,79 @@ bool CanvasWidget::HitTestWire(const QPointF& screen_pos,
   return false;
 }
 
+bool CanvasWidget::HitTestWireSegment(const QPointF& screen_pos,
+                                      localroute::Id* out_conn_id,
+                                      std::size_t* out_seg_index,
+                                      bool* out_is_vertical) const {
+  if (zoom_ < 0.25) {
+    return false;
+  }
+  const QPointF world_pos = ScreenToWorld(screen_pos);
+  const double tol_world = 5.0 / zoom_;
+  const double tol_sq = 25.0;  // 5px in screen space
+  const localroute::Rect probe{
+      world_pos.x() - tol_world, world_pos.y() - tol_world,
+      world_pos.x() + tol_world, world_pos.y() + tol_world};
+  const auto& view = ActiveView();
+  const auto& routes = view.all_routes();
+
+  bool found = false;
+  double best_dist_sq = tol_sq + 1.0;
+  bool best_is_middle = false;
+  localroute::Id best_cid = 0;
+  std::size_t best_idx = 0;
+  bool best_vert = false;
+
+  for (const auto& entry : route_cache_) {
+    if (!entry.bounds.Intersects(probe) ||
+        entry.status == localroute::Status::kPending) {
+      continue;
+    }
+    const auto rit = routes.find(entry.id);
+    if (rit == routes.end() || rit->second.points.size() < 2) {
+      continue;
+    }
+    const auto& pts = rit->second.points;
+    for (std::size_t j = 0; j + 1 < pts.size(); ++j) {
+      const localroute::Point& p0 = pts[j];
+      const localroute::Point& p1 = pts[j + 1];
+      if (std::abs(p0.x - p1.x) <= 1e-6 && std::abs(p0.y - p1.y) <= 1e-6) {
+        continue;
+      }
+      const QPointF a = WorldToScreen(QPointF(p0.x, p0.y));
+      const QPointF b = WorldToScreen(QPointF(p1.x, p1.y));
+      const double d2 = PointToSegDistSq(screen_pos, a, b);
+      if (d2 <= tol_sq) {
+        const bool is_middle =
+            (pts.size() >= 4 && j >= 1 && j + 2 < pts.size());
+        if (!found || d2 < best_dist_sq - 1.0 ||
+            (std::abs(d2 - best_dist_sq) <= 1.0 && is_middle &&
+             !best_is_middle)) {
+          found = true;
+          best_dist_sq = d2;
+          best_is_middle = is_middle;
+          best_cid = entry.id;
+          best_idx = j;
+          best_vert = std::abs(p0.x - p1.x) <= std::abs(p0.y - p1.y);
+        }
+      }
+    }
+  }
+  if (!found) {
+    return false;
+  }
+  if (out_conn_id) {
+    *out_conn_id = best_cid;
+  }
+  if (out_seg_index) {
+    *out_seg_index = best_idx;
+  }
+  if (out_is_vertical) {
+    *out_is_vertical = best_vert;
+  }
+  return true;
+}
+
 void CanvasWidget::StepSmokeDrag(const std::vector<localroute::Id>& ids,
                                  double dx, double dy) {
   if (ids.empty()) {
@@ -1028,6 +1145,45 @@ void CanvasWidget::StepSmokeDrag(const std::vector<localroute::Id>& ids,
     }
   }
   RecordRouteSample(route_time_ms_);
+}
+
+bool CanvasWidget::StepSmokeSegmentDrag(localroute::Id conn_id,
+                                        std::size_t seg_index,
+                                        double new_coord) {
+  QElapsedTimer timer;
+  timer.start();
+  bool ok = false;
+  if (mode_ == RouteMode::kSync && sync_router_) {
+    ok = sync_router_->MoveRouteSegment(conn_id, seg_index, new_coord);
+  } else if (mode_ == RouteMode::kAsync && async_router_) {
+    ok = async_router_->MoveRouteSegment(conn_id, seg_index, new_coord);
+  }
+  route_time_ms_ = static_cast<double>(timer.nsecsElapsed()) / 1e6;
+  RecordRouteSample(route_time_ms_);
+  if (ok) {
+    UpdateRouteCacheForIds({conn_id});
+    update();
+    emit StatusChanged();
+  }
+  return ok;
+}
+
+std::vector<localroute::Id> CanvasWidget::StepSmokeAutoRoute(
+    const std::vector<localroute::Id>& conn_ids) {
+  QElapsedTimer timer;
+  timer.start();
+  std::vector<localroute::Id> changed;
+  if (mode_ == RouteMode::kSync && sync_router_) {
+    changed = sync_router_->AutoRouteConnectors(conn_ids);
+  } else if (mode_ == RouteMode::kAsync && async_router_) {
+    changed = async_router_->AutoRouteConnectors(conn_ids);
+  }
+  route_time_ms_ = static_cast<double>(timer.nsecsElapsed()) / 1e6;
+  RecordRouteSample(route_time_ms_);
+  UpdateRouteCacheForIds(changed);
+  update();
+  emit StatusChanged();
+  return changed;
 }
 
 void CanvasWidget::OnAsyncTick() {
@@ -1118,6 +1274,7 @@ void CanvasWidget::mousePressEvent(QMouseEvent* event) {
     drag_kind_ = DragKind::kMoveBlocks;
     drag_start_world_ = world_pos;
     drag_initial_rects_.clear();
+    active_guides_.clear();
     highlighted_conns_.clear();
     for (localroute::Id id : selected_blocks_) {
       drag_initial_rects_.emplace(id, view.block(id).rect);
@@ -1131,7 +1288,28 @@ void CanvasWidget::mousePressEvent(QMouseEvent* event) {
     return;
   }
 
-  // 3. Check wire hit to allow clicking & deleting a wire.
+  // 3. Check wire segment hit for dragging middle segments, or wire hit for
+  //    selection.
+  localroute::Id seg_cid = 0;
+  std::size_t seg_idx = 0;
+  bool seg_vert = false;
+  if (!(event->modifiers() & Qt::ControlModifier) &&
+      HitTestWireSegment(event->pos(), &seg_cid, &seg_idx, &seg_vert)) {
+    selected_blocks_.clear();
+    highlighted_conns_.clear();
+    highlighted_conns_.insert(seg_cid);
+    has_selected_conn_ = true;
+    selected_conn_id_ = seg_cid;
+    drag_kind_ = DragKind::kMoveSegment;
+    drag_seg_conn_id_ = seg_cid;
+    drag_seg_index_ = seg_idx;
+    drag_seg_is_vertical_ = seg_vert;
+    setCursor(seg_vert ? Qt::SizeHorCursor : Qt::SizeVerCursor);
+    update();
+    emit SelectionChanged();
+    return;
+  }
+
   localroute::Id hit_cid = 0;
   if (!(event->modifiers() & Qt::ControlModifier) &&
       HitTestWire(event->pos(), &hit_cid)) {
@@ -1190,10 +1368,186 @@ void CanvasWidget::mouseMoveEvent(QMouseEvent* event) {
     return;
   }
 
+  if (drag_kind_ == DragKind::kMoveSegment) {
+    const QPointF world_pos = ScreenToWorld(pos);
+    const double new_coord =
+        drag_seg_is_vertical_ ? world_pos.x() : world_pos.y();
+    QElapsedTimer timer;
+    timer.start();
+    bool ok = false;
+    if (mode_ == RouteMode::kSync && sync_router_) {
+      ok = sync_router_->MoveRouteSegment(drag_seg_conn_id_, drag_seg_index_,
+                                          new_coord);
+    } else if (mode_ == RouteMode::kAsync && async_router_) {
+      ok = async_router_->MoveRouteSegment(drag_seg_conn_id_, drag_seg_index_,
+                                           new_coord);
+    }
+    route_time_ms_ = static_cast<double>(timer.nsecsElapsed()) / 1e6;
+    RecordRouteSample(route_time_ms_);
+    if (ok) {
+      const auto& view = ActiveView();
+      const auto rit = view.all_routes().find(drag_seg_conn_id_);
+      if (rit != view.all_routes().end() && rit->second.points.size() >= 2) {
+        const auto& pts = rit->second.points;
+        double best_err = std::numeric_limits<double>::max();
+        bool best_mid = false;
+        std::size_t best_j = 0;
+        for (std::size_t j = 0; j + 1 < pts.size(); ++j) {
+          const bool is_vert = std::abs(pts[j].x - pts[j + 1].x) <= 1e-6 &&
+                               std::abs(pts[j].y - pts[j + 1].y) > 1e-6;
+          const bool is_horiz = std::abs(pts[j].y - pts[j + 1].y) <= 1e-6 &&
+                                std::abs(pts[j].x - pts[j + 1].x) > 1e-6;
+          if ((drag_seg_is_vertical_ && !is_vert) ||
+              (!drag_seg_is_vertical_ && !is_horiz)) {
+            continue;
+          }
+          const double coord = drag_seg_is_vertical_ ? pts[j].x : pts[j].y;
+          const double err = std::abs(coord - new_coord);
+          const bool is_mid = (pts.size() >= 4 && j >= 1 && j + 2 < pts.size());
+          if (err < best_err - 1e-6 ||
+              (std::abs(err - best_err) <= 1e-6 && is_mid && !best_mid)) {
+            best_err = err;
+            best_mid = is_mid;
+            best_j = j;
+          }
+        }
+        if (best_err < std::numeric_limits<double>::max()) {
+          drag_seg_index_ = best_j;
+        }
+      }
+      UpdateRouteCacheForIds({drag_seg_conn_id_});
+      update();
+      emit StatusChanged();
+    }
+    return;
+  }
+
   if (drag_kind_ == DragKind::kMoveBlocks && !drag_initial_rects_.empty()) {
     const QPointF world_pos = ScreenToWorld(pos);
-    const double dx = world_pos.x() - drag_start_world_.x();
-    const double dy = world_pos.y() - drag_start_world_.y();
+    double dx = world_pos.x() - drag_start_world_.x();
+    double dy = world_pos.y() - drag_start_world_.y();
+    active_guides_.clear();
+
+    // Smart Guides: snap single-block drag to aligned peer port coordinates
+    // unless Alt is held.
+    if (drag_initial_rects_.size() == 1 &&
+        !(event->modifiers() & Qt::AltModifier)) {
+      const auto& view = ActiveView();
+      const localroute::Id bid = drag_initial_rects_.begin()->first;
+      const localroute::Rect init_r = drag_initial_rects_.begin()->second;
+      const localroute::Rect raw_r{init_r.l + dx, init_r.t + dy, init_r.r + dx,
+                                   init_r.b + dy};
+      const localroute::Block& blk = view.block(bid);
+      const auto find_pin = [](const localroute::Block& b,
+                               localroute::Id pid) -> const localroute::Pin* {
+        for (const auto& p : b.pins) {
+          if (p.id == pid) {
+            return &p;
+          }
+        }
+        return nullptr;
+      };
+      const auto pin_at_rect =
+          [](localroute::Rect r,
+             const localroute::Pin& p) -> localroute::Point {
+        return {p.x == 1.0 ? r.r : r.l + p.x * (r.r - r.l),
+                p.y == 1.0 ? r.b : r.t + p.y * (r.b - r.t)};
+      };
+
+      constexpr double kSnapTol = 5.0;
+      double best_dy_err = kSnapTol + 1e-6;
+      double snap_dy = 0.0;
+      bool has_snap_y = false;
+      double best_dx_err = kSnapTol + 1e-6;
+      double snap_dx = 0.0;
+      bool has_snap_x = false;
+
+      for (localroute::Id cid : view.adjacent_conns(bid)) {
+        const auto cit = view.all_conns().find(cid);
+        if (cit == view.all_conns().end() ||
+            cit->second.src == cit->second.dst) {
+          continue;
+        }
+        const localroute::Conn& c = cit->second;
+        const bool is_src = (c.src == bid);
+        const localroute::Id my_pid = is_src ? c.sp : c.dp;
+        const localroute::Id peer_bid = is_src ? c.dst : c.src;
+        const localroute::Id peer_pid = is_src ? c.dp : c.sp;
+        const localroute::Pin* my_pin = find_pin(blk, my_pid);
+        const localroute::Block& peer_blk = view.block(peer_bid);
+        const localroute::Pin* peer_pin = find_pin(peer_blk, peer_pid);
+        if (!my_pin || !peer_pin) {
+          continue;
+        }
+        const localroute::Point my_pt = pin_at_rect(raw_r, *my_pin);
+        const localroute::Point peer_pt = pin_at_rect(peer_blk.rect, *peer_pin);
+        if ((my_pin->dirs & (localroute::kLeft | localroute::kRight)) &&
+            (peer_pin->dirs & (localroute::kLeft | localroute::kRight))) {
+          const double err = std::abs(my_pt.y - peer_pt.y);
+          if (err <= kSnapTol && err < best_dy_err) {
+            best_dy_err = err;
+            snap_dy = peer_pt.y - my_pt.y;
+            has_snap_y = true;
+          }
+        }
+        if ((my_pin->dirs & (localroute::kUp | localroute::kDown)) &&
+            (peer_pin->dirs & (localroute::kUp | localroute::kDown))) {
+          const double err = std::abs(my_pt.x - peer_pt.x);
+          if (err <= kSnapTol && err < best_dx_err) {
+            best_dx_err = err;
+            snap_dx = peer_pt.x - my_pt.x;
+            has_snap_x = true;
+          }
+        }
+      }
+      if (has_snap_y) {
+        dy += snap_dy;
+      }
+      if (has_snap_x) {
+        dx += snap_dx;
+      }
+      if (has_snap_x || has_snap_y) {
+        const localroute::Rect snapped_r{init_r.l + dx, init_r.t + dy,
+                                         init_r.r + dx, init_r.b + dy};
+        for (localroute::Id cid : view.adjacent_conns(bid)) {
+          const auto cit = view.all_conns().find(cid);
+          if (cit == view.all_conns().end() ||
+              cit->second.src == cit->second.dst) {
+            continue;
+          }
+          const localroute::Conn& c = cit->second;
+          const bool is_src = (c.src == bid);
+          const localroute::Pin* my_pin = find_pin(blk, is_src ? c.sp : c.dp);
+          const localroute::Block& peer_blk =
+              view.block(is_src ? c.dst : c.src);
+          const localroute::Pin* peer_pin =
+              find_pin(peer_blk, is_src ? c.dp : c.sp);
+          if (!my_pin || !peer_pin) {
+            continue;
+          }
+          const localroute::Point my_pt = pin_at_rect(snapped_r, *my_pin);
+          const localroute::Point peer_pt =
+              pin_at_rect(peer_blk.rect, *peer_pin);
+          if (has_snap_y &&
+              (my_pin->dirs & (localroute::kLeft | localroute::kRight)) &&
+              (peer_pin->dirs & (localroute::kLeft | localroute::kRight)) &&
+              std::abs(my_pt.y - peer_pt.y) <= 1e-4) {
+            active_guides_.push_back({false, peer_pt.y,
+                                      std::min(my_pt.x, peer_pt.x) - 36.0,
+                                      std::max(my_pt.x, peer_pt.x) + 36.0});
+          }
+          if (has_snap_x &&
+              (my_pin->dirs & (localroute::kUp | localroute::kDown)) &&
+              (peer_pin->dirs & (localroute::kUp | localroute::kDown)) &&
+              std::abs(my_pt.x - peer_pt.x) <= 1e-4) {
+            active_guides_.push_back({true, peer_pt.x,
+                                      std::min(my_pt.y, peer_pt.y) - 36.0,
+                                      std::max(my_pt.y, peer_pt.y) + 36.0});
+          }
+        }
+      }
+    }
+
     std::vector<std::pair<localroute::Id, localroute::Rect>> moves;
     std::vector<localroute::Id> moved_ids;
     moves.reserve(drag_initial_rects_.size());
@@ -1238,7 +1592,7 @@ void CanvasWidget::mouseMoveEvent(QMouseEvent* event) {
     return;
   }
 
-  // Idle hover highlight on pins
+  // Idle hover highlight on pins and wire segments
   if (drag_kind_ == DragKind::kNone && !space_pressed_) {
     const PinHit p = HitTestPin(pos, 12.0);
     const bool changed = (p.valid != hover_pin_.valid) ||
@@ -1246,8 +1600,23 @@ void CanvasWidget::mouseMoveEvent(QMouseEvent* event) {
                                       p.pin_id != hover_pin_.pin_id));
     if (changed) {
       hover_pin_ = p;
-      setCursor(hover_pin_.valid ? Qt::CrossCursor : Qt::ArrowCursor);
       update();
+    }
+    if (p.valid) {
+      setCursor(Qt::CrossCursor);
+    } else if (zoom_ >= 0.25 &&
+               HitTestBlock(ScreenToWorld(pos)) ==
+                   std::numeric_limits<localroute::Id>::max()) {
+      localroute::Id seg_cid = 0;
+      std::size_t seg_idx = 0;
+      bool seg_vert = false;
+      if (HitTestWireSegment(pos, &seg_cid, &seg_idx, &seg_vert)) {
+        setCursor(seg_vert ? Qt::SizeHorCursor : Qt::SizeVerCursor);
+      } else {
+        setCursor(Qt::ArrowCursor);
+      }
+    } else {
+      setCursor(Qt::ArrowCursor);
     }
   }
 }
@@ -1304,8 +1673,17 @@ void CanvasWidget::mouseReleaseEvent(QMouseEvent* event) {
     return;
   }
 
+  if (drag_kind_ == DragKind::kMoveSegment) {
+    drag_kind_ = DragKind::kNone;
+    setCursor(Qt::ArrowCursor);
+    update();
+    emit StatusChanged();
+    return;
+  }
+
   if (drag_kind_ == DragKind::kMoveBlocks) {
     drag_kind_ = DragKind::kNone;
+    active_guides_.clear();
     if (mode_ == RouteMode::kSync && sync_router_) {
       std::vector<localroute::Id> moved_ids;
       for (const auto& kv : drag_initial_rects_) {
@@ -1528,12 +1906,45 @@ void CanvasWidget::paintEvent(QPaintEvent* /*event*/) {
       highlight_fallback_ ? QPen(QColor(230, 126, 34), 2.2) : hi_valid_pen;
   hi_display_pen.setCosmetic(true);
 
+  const bool draw_solder = zoom_ >= 0.25;
+  const bool draw_hops = zoom_ >= 0.4 && show_line_hops_;
+
+  struct VisHSeg {
+    double x0 = 0.0;
+    double x1 = 0.0;
+    double y = 0.0;
+    localroute::Id src = 0;
+    localroute::Id sp = 0;
+    int bucket = 0;  // 0: valid, 1: display, 2: hi_valid, 3: hi_display
+  };
+  struct VisVSeg {
+    double x = 0.0;
+    double y0 = 0.0;
+    double y1 = 0.0;
+    localroute::Id src = 0;
+    localroute::Id sp = 0;
+  };
+
   QVector<QLineF> valid_segs;
   QVector<QLineF> pending_segs;
   QVector<QLineF> display_segs;
+  QVector<QLineF> hi_valid_segs;
+  QVector<QLineF> hi_pending_segs;
+  QVector<QLineF> hi_display_segs;
   valid_segs.reserve(2048);
   pending_segs.reserve(1024);
   display_segs.reserve(128);
+  std::vector<localroute::Id> visible_conn_ids;
+  if (draw_solder) {
+    visible_conn_ids.reserve(512);
+  }
+  std::vector<VisHSeg> vis_h;
+  std::vector<VisVSeg> vis_v;
+  std::array<std::vector<QRectF>, 4> hop_arcs;
+  if (draw_hops) {
+    vis_h.reserve(1024);
+    vis_v.reserve(1024);
+  }
   std::vector<localroute::Id> top_highlight;
   top_highlight.reserve(highlighted_conns_.size());
 
@@ -1562,18 +1973,65 @@ void CanvasWidget::paintEvent(QPaintEvent* /*event*/) {
     }
   };
 
+  auto append_hop_candidate = [&](int bucket, const localroute::Conn& conn,
+                                  localroute::Point p0, localroute::Point p1) {
+    QVector<QLineF>* dst = nullptr;
+    switch (bucket) {
+      case 0:
+        dst = &valid_segs;
+        break;
+      case 1:
+        dst = &display_segs;
+        break;
+      case 2:
+        dst = &hi_valid_segs;
+        break;
+      default:
+        dst = &hi_display_segs;
+        break;
+    }
+    if (p0.x == p1.x) {
+      if (p0.x < vp.l || p0.x > vp.r) {
+        return;
+      }
+      const double y0 = std::clamp(std::min(p0.y, p1.y), vp.t, vp.b);
+      const double y1 = std::clamp(std::max(p0.y, p1.y), vp.t, vp.b);
+      if (y0 < y1) {
+        dst->append(QLineF(p0.x, y0, p0.x, y1));
+        vis_v.push_back({p0.x, y0, y1, conn.src, conn.sp});
+      }
+    } else if (p0.y == p1.y) {
+      if (p0.y < vp.t || p0.y > vp.b) {
+        return;
+      }
+      const double x0 = std::clamp(std::min(p0.x, p1.x), vp.l, vp.r);
+      const double x1 = std::clamp(std::max(p0.x, p1.x), vp.l, vp.r);
+      if (x0 < x1) {
+        vis_h.push_back({x0, x1, p0.y, conn.src, conn.sp, bucket});
+      }
+    } else if (localroute::Box(p0, p1).Intersects(vp)) {
+      dst->append(QLineF(p0.x, p0.y, p1.x, p1.y));
+    }
+  };
+
   const auto& all_blocks = view.all_blocks();
   const auto& all_conns = view.all_conns();
   std::size_t drawn_conns = 0;
   for (const auto& entry : route_cache_) {
     if (highlighted_conns_.count(entry.id)) {
       top_highlight.push_back(entry.id);
+      if (draw_solder && entry.bounds.Intersects(vp)) {
+        visible_conn_ids.push_back(entry.id);
+      }
       continue;
     }
     if (!entry.bounds.Intersects(vp)) {
       continue;
     }
     ++drawn_conns;
+    if (draw_solder) {
+      visible_conn_ids.push_back(entry.id);
+    }
     if (entry.status == localroute::Status::kPending) {
       const auto& c = all_conns.at(entry.id);
       const localroute::Point a = PinPos(all_blocks.at(c.src), c.sp);
@@ -1590,11 +2048,141 @@ void CanvasWidget::paintEvent(QPaintEvent* /*event*/) {
       if (rit == routes.end() || rit->second.points.size() < 2) {
         continue;
       }
-      auto& dst = (entry.status == localroute::Status::kValid) ? valid_segs
-                                                               : display_segs;
       const auto& pts = rit->second.points;
-      for (std::size_t j = 1; j < pts.size(); ++j) {
-        append_clipped(&dst, pts[j - 1], pts[j]);
+      if (draw_hops) {
+        const int bucket = (entry.status == localroute::Status::kValid) ? 0 : 1;
+        const auto& c = all_conns.at(entry.id);
+        for (std::size_t j = 1; j < pts.size(); ++j) {
+          append_hop_candidate(bucket, c, pts[j - 1], pts[j]);
+        }
+      } else {
+        auto& dst = (entry.status == localroute::Status::kValid) ? valid_segs
+                                                                 : display_segs;
+        for (std::size_t j = 1; j < pts.size(); ++j) {
+          append_clipped(&dst, pts[j - 1], pts[j]);
+        }
+      }
+    }
+  }
+
+  for (localroute::Id cid : top_highlight) {
+    ++drawn_conns;
+    const auto rit = routes.find(cid);
+    if (rit == routes.end() ||
+        rit->second.status == localroute::Status::kPending ||
+        rit->second.points.empty()) {
+      const auto& c = all_conns.at(cid);
+      const localroute::Point a = PinPos(all_blocks.at(c.src), c.sp);
+      const localroute::Point b = PinPos(all_blocks.at(c.dst), c.dp);
+      if (a.x == b.x || a.y == b.y) {
+        append_clipped(&hi_pending_segs, a, b);
+      } else {
+        const localroute::Point corner{b.x, a.y};
+        append_clipped(&hi_pending_segs, a, corner);
+        append_clipped(&hi_pending_segs, corner, b);
+      }
+    } else {
+      const auto& pts = rit->second.points;
+      if (draw_hops) {
+        const int bucket =
+            (rit->second.status == localroute::Status::kValid) ? 2 : 3;
+        const auto& c = all_conns.at(cid);
+        for (std::size_t j = 1; j < pts.size(); ++j) {
+          append_hop_candidate(bucket, c, pts[j - 1], pts[j]);
+        }
+      } else {
+        auto& dst = (rit->second.status == localroute::Status::kValid)
+                        ? hi_valid_segs
+                        : hi_display_segs;
+        for (std::size_t j = 1; j < pts.size(); ++j) {
+          append_clipped(&dst, pts[j - 1], pts[j]);
+        }
+      }
+    }
+  }
+
+  if (draw_hops && !vis_h.empty()) {
+    const double hop_r = std::clamp(4.5 / std::max(zoom_, 0.4), 3.5, 7.0);
+    std::sort(vis_v.begin(), vis_v.end(),
+              [](const VisVSeg& a, const VisVSeg& b) { return a.x < b.x; });
+    std::vector<double> crossings;
+    for (const VisHSeg& h : vis_h) {
+      QVector<QLineF>* dst = nullptr;
+      switch (h.bucket) {
+        case 0:
+          dst = &valid_segs;
+          break;
+        case 1:
+          dst = &display_segs;
+          break;
+        case 2:
+          dst = &hi_valid_segs;
+          break;
+        default:
+          dst = &hi_display_segs;
+          break;
+      }
+      if (h.x1 - h.x0 <= 2.0 * hop_r || vis_v.empty()) {
+        dst->append(QLineF(h.x0, h.y, h.x1, h.y));
+        continue;
+      }
+      crossings.clear();
+      const auto it0 = std::upper_bound(
+          vis_v.begin(), vis_v.end(), h.x0 + hop_r,
+          [](double val, const VisVSeg& v) { return val < v.x; });
+      for (auto it = it0; it != vis_v.end() && it->x < h.x1 - hop_r; ++it) {
+        if (it->src == h.src && it->sp == h.sp) {
+          continue;
+        }
+        if (it->y0 + hop_r < h.y && h.y < it->y1 - hop_r) {
+          crossings.push_back(it->x);
+        }
+      }
+      if (crossings.empty()) {
+        dst->append(QLineF(h.x0, h.y, h.x1, h.y));
+        continue;
+      }
+      std::sort(crossings.begin(), crossings.end());
+      std::size_t write = 0;
+      for (double cx : crossings) {
+        if (write == 0 || cx - crossings[write - 1] > 1e-3) {
+          crossings[write++] = cx;
+        }
+      }
+      crossings.resize(write);
+
+      double cur_x = h.x0;
+      for (std::size_t i = 0; i < crossings.size();) {
+        std::size_t j = i;
+        while (j + 1 < crossings.size() &&
+               crossings[j + 1] - crossings[j] < 3.0) {
+          ++j;
+        }
+        const double ix_l = crossings[i];
+        const double ix_r = crossings[j];
+        double r_l = std::min(hop_r, ix_l - cur_x);
+        double r_r = std::min(hop_r, h.x1 - ix_r);
+        if (i > 0) {
+          r_l = std::min(r_l, 0.45 * (ix_l - crossings[i - 1]));
+        }
+        if (j + 1 < crossings.size()) {
+          r_r = std::min(r_r, 0.45 * (crossings[j + 1] - ix_r));
+        }
+        const double r = std::min(r_l, r_r);
+        if (r >= 1.2) {
+          const double arc_l = ix_l - r;
+          const double arc_r = ix_r + r;
+          if (arc_l > cur_x + 1e-6) {
+            dst->append(QLineF(cur_x, h.y, arc_l, h.y));
+          }
+          hop_arcs[h.bucket].push_back(
+              QRectF(arc_l, h.y - r, arc_r - arc_l, 2.0 * r));
+          cur_x = arc_r;
+        }
+        i = j + 1;
+      }
+      if (h.x1 > cur_x + 1e-6) {
+        dst->append(QLineF(cur_x, h.y, h.x1, h.y));
       }
     }
   }
@@ -1610,6 +2198,22 @@ void CanvasWidget::paintEvent(QPaintEvent* /*event*/) {
   if (!display_segs.isEmpty()) {
     painter.setPen(display_pen);
     painter.drawLines(display_segs);
+  }
+  if (draw_hops && (!hop_arcs[0].empty() || !hop_arcs[1].empty())) {
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    if (!hop_arcs[0].empty()) {
+      painter.setPen(valid_pen);
+      for (const QRectF& arc_rect : hop_arcs[0]) {
+        painter.drawArc(arc_rect, 0, 180 * 16);
+      }
+    }
+    if (!hop_arcs[1].empty()) {
+      painter.setPen(display_pen);
+      for (const QRectF& arc_rect : hop_arcs[1]) {
+        painter.drawArc(arc_rect, 0, 180 * 16);
+      }
+    }
+    painter.setRenderHint(QPainter::Antialiasing, false);
   }
 
   const auto vis_ids = view.QueryBlocks(vp);
@@ -1703,35 +2307,6 @@ void CanvasWidget::paintEvent(QPaintEvent* /*event*/) {
   }
 
   painter.setRenderHint(QPainter::Antialiasing, high_detail);
-  QVector<QLineF> hi_valid_segs;
-  QVector<QLineF> hi_pending_segs;
-  QVector<QLineF> hi_display_segs;
-  for (localroute::Id cid : top_highlight) {
-    ++drawn_conns;
-    const auto rit = routes.find(cid);
-    if (rit == routes.end() ||
-        rit->second.status == localroute::Status::kPending ||
-        rit->second.points.empty()) {
-      const auto& c = all_conns.at(cid);
-      const localroute::Point a = PinPos(all_blocks.at(c.src), c.sp);
-      const localroute::Point b = PinPos(all_blocks.at(c.dst), c.dp);
-      if (a.x == b.x || a.y == b.y) {
-        append_clipped(&hi_pending_segs, a, b);
-      } else {
-        const localroute::Point corner{b.x, a.y};
-        append_clipped(&hi_pending_segs, a, corner);
-        append_clipped(&hi_pending_segs, corner, b);
-      }
-    } else {
-      auto& dst = (rit->second.status == localroute::Status::kValid)
-                      ? hi_valid_segs
-                      : hi_display_segs;
-      const auto& pts = rit->second.points;
-      for (std::size_t j = 1; j < pts.size(); ++j) {
-        append_clipped(&dst, pts[j - 1], pts[j]);
-      }
-    }
-  }
   if (!hi_valid_segs.isEmpty()) {
     painter.setPen(hi_valid_pen);
     painter.drawLines(hi_valid_segs);
@@ -1744,7 +2319,49 @@ void CanvasWidget::paintEvent(QPaintEvent* /*event*/) {
     painter.setPen(hi_display_pen);
     painter.drawLines(hi_display_segs);
   }
+  if (draw_hops && (!hop_arcs[2].empty() || !hop_arcs[3].empty())) {
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    if (!hop_arcs[2].empty()) {
+      painter.setPen(hi_valid_pen);
+      for (const QRectF& arc_rect : hop_arcs[2]) {
+        painter.drawArc(arc_rect, 0, 180 * 16);
+      }
+    }
+    if (!hop_arcs[3].empty()) {
+      painter.setPen(hi_display_pen);
+      for (const QRectF& arc_rect : hop_arcs[3]) {
+        painter.drawArc(arc_rect, 0, 180 * 16);
+      }
+    }
+  }
+  if (draw_solder && !visible_conn_ids.empty()) {
+    const std::vector<localroute::Point> solder_joints =
+        view.ComputeSolderJoints(visible_conn_ids);
+    if (!solder_joints.empty()) {
+      painter.setRenderHint(QPainter::Antialiasing, true);
+      painter.setPen(Qt::NoPen);
+      painter.setBrush(QColor(30, 78, 140));
+      const double dot_r = 3.2 / std::clamp(zoom_, 0.4, 1.5);
+      for (const localroute::Point pt : solder_joints) {
+        painter.drawEllipse(QPointF(pt.x, pt.y), dot_r, dot_r);
+      }
+    }
+  }
   visible_conn_count_ = drawn_conns;
+
+  // Smart Guides (alignment lines shown while single-block snapping is active)
+  if (!active_guides_.empty()) {
+    QPen guide_pen(QColor(64, 158, 255, 220), 1.5, Qt::DashLine);
+    guide_pen.setCosmetic(true);
+    painter.setPen(guide_pen);
+    for (const SmartGuideLine& g : active_guides_) {
+      if (g.is_vertical) {
+        painter.drawLine(QPointF(g.coord, g.span0), QPointF(g.coord, g.span1));
+      } else {
+        painter.drawLine(QPointF(g.span0, g.coord), QPointF(g.span1, g.coord));
+      }
+    }
+  }
 
   // Interactive wiring preview
   if (drag_kind_ == DragKind::kWiring) {

@@ -25,6 +25,8 @@ class MainWindow : public QMainWindow {
   void OnThirdPartyToggled(bool checked);
   void OnChannelNudgingToggled(bool checked);
   void OnHighlightFallbackToggled(bool checked);
+  void OnLineHopsToggled(bool checked);
+  void OnAutoRouteClicked();
   void OnClearCanvas();
   void OnPortSpinChanged();
   void SyncInspectorFromSelection();
@@ -40,6 +42,8 @@ class MainWindow : public QMainWindow {
   QCheckBox* third_party_check_ = nullptr;
   QCheckBox* nudging_check_ = nullptr;
   QCheckBox* highlight_fallback_check_ = nullptr;
+  QCheckBox* hops_check_ = nullptr;
+  QPushButton* auto_route_btn_ = nullptr;
 
   // Inspector controls
   QLabel* sel_title_label_ = nullptr;

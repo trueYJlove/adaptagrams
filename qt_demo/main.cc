@@ -161,6 +161,35 @@ int main(int argc, char* argv[]) {
     throw std::runtime_error("preset cascade drag anchor invariance failed");
   }
 
+  // Verify solder joints on Cascade preset (B8 fans out to B11 and B12).
+  const std::vector<localroute::Point> cascade_joints =
+      canvas->router_view().ComputeSolderJoints({1, 2, 3, 4});
+  if (cascade_joints.empty()) {
+    throw std::runtime_error("preset cascade solder joint missing");
+  }
+
+  // Verify segment drag + user_modified preservation + AutoRoute recovery.
+  if (!canvas->StepSmokeSegmentDrag(1, 1, 210.0)) {
+    throw std::runtime_error("smoke segment drag failed");
+  }
+  canvas->render(&scratch);
+  if (!canvas->router_view().route(1).user_modified ||
+      std::abs(canvas->router_view().route(1).points[1].x - 210.0) > 1e-6) {
+    throw std::runtime_error("smoke segment drag did not lock route");
+  }
+  canvas->StepSmokeDrag({9}, 0.0, 10.0);
+  canvas->render(&scratch);
+  if (!canvas->router_view().route(1).user_modified ||
+      std::abs(canvas->router_view().route(1).points[1].x - 210.0) > 1e-6) {
+    throw std::runtime_error("smoke segment drag lock lost on block move");
+  }
+  const auto auto_routed = canvas->StepSmokeAutoRoute({1});
+  canvas->render(&scratch);
+  if (auto_routed.empty() || canvas->router_view().route(1).user_modified ||
+      canvas->router_view().route(1).status != localroute::Status::kValid) {
+    throw std::runtime_error("smoke auto-route did not clear user_modified");
+  }
+
   std::cout << "SMOKE_PASS" << " async_cold_route_ms=" << async_cold_route_ms
             << " async_cold_paint_ms=" << async_cold_paint_ms
             << " async_vis=" << async_vis_blocks << "/" << async_vis_conns

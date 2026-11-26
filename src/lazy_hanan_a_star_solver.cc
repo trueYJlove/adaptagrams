@@ -19,6 +19,7 @@ constexpr std::uint8_t kBlkSrc = 2;
 constexpr std::uint8_t kBlkDst = 4;
 constexpr std::uint8_t kBlkAny = kBlkOther | kBlkSrc | kBlkDst;
 constexpr std::uint8_t kEdgeBorder = 8;
+constexpr std::uint8_t kEdgeWireOccupied = 16;
 
 constexpr int kDirDx[4] = {0, 0, -1, 1};
 constexpr int kDirDy[4] = {-1, 1, 0, 0};
@@ -299,6 +300,10 @@ class LazyHananAStarSolverImpl final : public LocalRouteSolver {
           EffectiveObstacleBuffer(b_obs->rect, a, b, q.cfg.buffer));
     };
 
+    const bool check_wires = q.occupied_wires && !q.occupied_wires->empty() &&
+                             q.cfg.wire_overlap_penalty > 0.0;
+    const double wire_match_eps = std::min(1.5, q.cfg.nudge_distance * 0.25);
+
     if (a.x == b.x || a.y == b.y) {
       const unsigned d = OrthoDir(a, b);
       const int d_idx = (d == kUp ? 0 : d == kDown ? 1 : d == kLeft ? 2 : 3);
@@ -316,6 +321,34 @@ class LazyHananAStarSolverImpl final : public LocalRouteSolver {
             if (Crosses(a, b, obs_rect(b_obs))) {
               ok = false;
               break;
+            }
+          }
+        }
+        if (ok && check_wires) {
+          for (const OccupiedSegment& occ : *q.occupied_wires) {
+            if (occ.src_block == q.conn.src && occ.src_pin == q.conn.sp) {
+              continue;
+            }
+            if (a.y == b.y && std::abs(occ.u.y - occ.v.y) <= 1e-6 &&
+                std::abs(occ.u.y - a.y) <= wire_match_eps) {
+              const double ov0 =
+                  std::max(std::min(a.x, b.x), std::min(occ.u.x, occ.v.x));
+              const double ov1 =
+                  std::min(std::max(a.x, b.x), std::max(occ.u.x, occ.v.x));
+              if (ov1 - ov0 > 1e-3) {
+                ok = false;
+                break;
+              }
+            } else if (a.x == b.x && std::abs(occ.u.x - occ.v.x) <= 1e-6 &&
+                       std::abs(occ.u.x - a.x) <= wire_match_eps) {
+              const double ov0 =
+                  std::max(std::min(a.y, b.y), std::min(occ.u.y, occ.v.y));
+              const double ov1 =
+                  std::min(std::max(a.y, b.y), std::max(occ.u.y, occ.v.y));
+              if (ov1 - ov0 > 1e-3) {
+                ok = false;
+                break;
+              }
             }
           }
         }
@@ -495,6 +528,83 @@ class LazyHananAStarSolverImpl final : public LocalRouteSolver {
       }
     }
 
+    if (check_wires) {
+      for (const OccupiedSegment& occ : *q.occupied_wires) {
+        if (occ.src_block == q.conn.src && occ.src_pin == q.conn.sp) {
+          continue;
+        }
+        if (std::abs(occ.u.y - occ.v.y) <= 1e-6 &&
+            std::abs(occ.u.x - occ.v.x) > 1e-6) {
+          const double wy = 0.5 * (occ.u.y + occ.v.y);
+          const double wx0 = std::min(occ.u.x, occ.v.x);
+          const double wx1 = std::max(occ.u.x, occ.v.x);
+          const int y0 = std::max(
+              0, static_cast<int>(std::lower_bound(ys.begin(), ys.end(),
+                                                   wy - wire_match_eps) -
+                                  ys.begin()));
+          const int y1 = std::min(
+              h, static_cast<int>(std::upper_bound(ys.begin(), ys.end(),
+                                                   wy + wire_match_eps) -
+                                  ys.begin()));
+          if (y0 >= y1) {
+            continue;
+          }
+          const int x0 = std::max(
+              0, static_cast<int>(std::lower_bound(xs.begin(), xs.end(), wx0) -
+                                  xs.begin()) -
+                     1);
+          const int x1 = std::min(
+              w - 1,
+              static_cast<int>(std::upper_bound(xs.begin(), xs.end(), wx1) -
+                               xs.begin()));
+          for (int iy = y0; iy < y1; ++iy) {
+            std::uint8_t* row_ptr =
+                edge_h.data() +
+                static_cast<size_t>(iy) * static_cast<size_t>(w - 1);
+            for (int ix = x0; ix < x1; ++ix) {
+              if (xs[ix + 1] > wx0 + 1e-3 && xs[ix] < wx1 - 1e-3) {
+                row_ptr[ix] |= kEdgeWireOccupied;
+              }
+            }
+          }
+        } else if (std::abs(occ.u.x - occ.v.x) <= 1e-6 &&
+                   std::abs(occ.u.y - occ.v.y) > 1e-6) {
+          const double wx = 0.5 * (occ.u.x + occ.v.x);
+          const double wy0 = std::min(occ.u.y, occ.v.y);
+          const double wy1 = std::max(occ.u.y, occ.v.y);
+          const int x0 = std::max(
+              0, static_cast<int>(std::lower_bound(xs.begin(), xs.end(),
+                                                   wx - wire_match_eps) -
+                                  xs.begin()));
+          const int x1 = std::min(
+              w, static_cast<int>(std::upper_bound(xs.begin(), xs.end(),
+                                                   wx + wire_match_eps) -
+                                  xs.begin()));
+          if (x0 >= x1) {
+            continue;
+          }
+          const int y0 = std::max(
+              0, static_cast<int>(std::lower_bound(ys.begin(), ys.end(), wy0) -
+                                  ys.begin()) -
+                     1);
+          const int y1 = std::min(
+              h - 1,
+              static_cast<int>(std::upper_bound(ys.begin(), ys.end(), wy1) -
+                               ys.begin()));
+          for (int iy = y0; iy < y1; ++iy) {
+            if (!(ys[iy + 1] > wy0 + 1e-3 && ys[iy] < wy1 - 1e-3)) {
+              continue;
+            }
+            std::uint8_t* row_ptr = edge_v.data() + static_cast<size_t>(iy) *
+                                                        static_cast<size_t>(w);
+            for (int ix = x0; ix < x1; ++ix) {
+              row_ptr[ix] |= kEdgeWireOccupied;
+            }
+          }
+        }
+      }
+    }
+
     auto edge_flags = [&](int x0, int y0, int d_idx) -> std::uint8_t {
       if (d_idx == 0) {
         return edge_v[static_cast<size_t>(y0 - 1) * static_cast<size_t>(w) +
@@ -540,7 +650,8 @@ class LazyHananAStarSolverImpl final : public LocalRouteSolver {
         if (f & (kBlkOther | kBlkSrc)) {
           break;
         }
-        cost += step_length(cx, cy, nx, ny);
+        cost += step_length(cx, cy, nx, ny) +
+                ((f & kEdgeWireOccupied) ? q.cfg.wire_overlap_penalty : 0.0);
         cx = nx;
         cy = ny;
         ++steps;
@@ -614,7 +725,8 @@ class LazyHananAStarSolverImpl final : public LocalRouteSolver {
           if (f & (kBlkOther | kBlkDst)) {
             break;
           }
-          cost += step_length(cx, cy, nx, ny);
+          cost += step_length(cx, cy, nx, ny) +
+                  ((f & kEdgeWireOccupied) ? q.cfg.wire_overlap_penalty : 0.0);
           cx = nx;
           cy = ny;
           ++steps;
@@ -703,9 +815,11 @@ class LazyHananAStarSolverImpl final : public LocalRouteSolver {
             continue;
           }
 
-          const double ng = cur.g + step_length(ix, iy, nx, ny) +
-                            (d != cur_dir ? q.cfg.penalty : 0.0) +
-                            ((f & kEdgeBorder) ? 1e-4 : 0.0);
+          const double ng =
+              cur.g + step_length(ix, iy, nx, ny) +
+              (d != cur_dir ? q.cfg.penalty : 0.0) +
+              ((f & kEdgeBorder) ? 1e-4 : 0.0) +
+              ((f & kEdgeWireOccupied) ? q.cfg.wire_overlap_penalty : 0.0);
           if (ws.visited_stamp[ns] != stamp || ng < ws.g_cost[ns]) {
             ws.visited_stamp[ns] = stamp;
             ws.g_cost[ns] = ng;

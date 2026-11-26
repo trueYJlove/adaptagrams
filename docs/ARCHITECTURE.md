@@ -2,9 +2,16 @@
 
 本文档对应仓库精简后的纯 C++17 正交布线引擎（命名空间 `localroute`），遵循 Google C++ Style Guide（仓库根目录 `.clang-format` 采用 `BasedOnStyle: Google`），涵盖整体分层架构、核心算法原理、线程模型、配置参数说明及 C++ / GUI 接入范例。
 
-## 1. 设计目标与核心契约
+## 1. 设计目标、Simulink 核心原则与工程契约
 
-本引擎面向类 Simulink 电气拓扑与框图建模软件，针对 **1,000 ~ 10,000+ 模块、2,000 ~ 20,000+ 连线** 的交互式编辑场景设计，遵循以下四条核心契约：
+本引擎面向类 Simulink 电气拓扑与框图建模软件，针对 **1,000 ~ 10,000+ 模块、2,000 ~ 20,000+ 连线** 的交互式编辑场景设计，以 MathWorks Simulink 编辑器的四大核心交互/布线原则作为长期架构准绳：
+
+1. **最小扰动原则（Minimum Disturbance）**：智能布线的首要目标不是每次都重算全局最短路，而是**尽可能少地打扰已有布局**——拖动模块时非关联连线保持绝对静止；框选多块移动时内部拓扑刚性平移，仅外部连线重算；用户手动调整过的线段（`Route::user_modified = true`）在后续移动与分轨中应尽量保留，且模块层级遵循所见即所得（拖拽不临时置顶）。
+2. **交互态与整理态严格分层**：高频交互拖拽追求亚毫秒级响应与低扰动（保持 `occupied_wires = nullptr`）；只有在用户显式触发 `AutoRouteConnectors`（`整理选中线 (Auto-route)`）或全图整理时，才执行更彻底的避障、拥挤分流（`wire_overlap_penalty`）与通道分轨。
+3. **同源分线与动态焊点（Branching & Solder Joints）**：同一源引脚 `(src, sp)` 扇出的多条连线在视觉上共享主干并在分叉处以实心焊点（`ComputeSolderJoints`）明确标识连通；不同源连线的正交交叉则通过跳线弧（Line Hops）清晰区分“跨过不连通”。
+4. **可预测的避障与直线保持（Orthogonal Avoidance & Preserve Straightness）**：常规连线保持严格正交避障与引脚出线方向约束；当拖动单模块使端口近似对齐时提供直线吸附（Smart Guides），保持无拐直线；当模块重叠无法避障时提供不反转引脚方向的确定性外环兜底。
+
+在此原则之上，工程实现严格恪守以下四条底层契约：
 
 1. **零外部依赖、纯 C++17**：核心静态库 `local_router` 仅依赖 C++17 标准库与 `Threads::Threads`，无 `libavoid` 或任何第三方库依赖，跨平台支持 Windows（MSVC / Clang）与 Linux（GCC / Clang）。
 2. **默认“移模块压线，线不动”**：在默认配置（`Config::reroute_third_party_blocked = false`）下，拖动模块时**仅重算与移动模块直接相连的连线**，其余非关联连线保持绝对静止（允许临时穿模），避免无关连线跳变与拖动帧率抖动。
@@ -51,9 +58,10 @@ qt_demo/
    * 起止引脚重合 → 标记 `Outcome::kCoincidentPins`、`Status::kFailed`；
    * 仅当起点或终点引脚埋入**第三方模块本体矩形 `rect.Inside(end)`** 内部时标记 `Outcome::kBuriedPin`、`Status::kDisplayOnly`；
    * 若引脚位于第三方模块 `buffer` 膨胀缝隙中（`gap < cfg.buffer` 且未进入本体矩形），不直接弃算，而是将该邻近障碍与对应起止端点的有效缓冲动态收缩至 `std::max(0.0, gap * 0.5 - 0.5)`（`LazyHananAStarSolver` 与 `accept()`/`ValidateAndSimplifyRoute()` 共享同一公式），允许从窄缝正常出线并执行完整 A* 避障。
-2. **轻量快路径（`Config::fast_paths = true` 且非松手微调时启用）**：
+2. **轻量快路径与手动路径锁定（`Config::fast_paths` / `Route::user_modified`）**：
+   * **第零优先级 — 手调路径保留（`user_modified == true`）**：当用户通过 `MoveRouteSegment()` 手动调整过连线线段后，在后续关联模块拖动（含松手 `settled = true`）时优先尝试整线平移与**端点正交修补复用（`RouteMethod::kReuse`）**，通过 `accept()` 复验即保留 `user_modified = true` 与手调中段（不再被 `Simple` L/Z 强行覆盖）；仅当手调中段撞上障碍物或方向非法无法通过复验时，才回退常规求解并自动清除 `user_modified`。
    * **第一优先级 — 整线平移复用（`RouteMethod::kReuse`）**：当起止端点位移量 `(dx, dy)` 完全相等（典型为框选批量拖动内部连线）时，整条旧折线平移后直接复验，命中即微秒级返回。
-   * **第二优先级 — L / Z 轻量候选（`RouteMethod::kSimple`）**：优先尝试 2 段 L 型折线及中点/缓冲边界对齐的 3 段 Z 型折线并复验；只要拖动后存在无障碍的简洁 2/3 段通路，折线会立即自动收直，彻底消除旧中段残留导致的 4 拐回折尾巴。
+   * **第二优先级 — L / Z 轻量候选（`RouteMethod::kSimple`）**：优先尝试 2 段 L 型折线及中点/缓冲边界对齐的 3 段 Z 型折线并复验；只要拖动后存在无障碍的简洁 2/3 段通路，折线会立即自动收直，彻底消除旧中段残留导致的 4 拐回折尾巴。在显式整理（`AutoRouteConnectors`）模式下，会跳过 `kReuse` 并检查候选是否与 `occupied_wires` 重叠，避免快路径强挤拥挤缝隙。
    * **第三优先级 — 端点修补复用（`RouteMethod::kReuse`）**：仅当 `Simple` 被障碍物阻挡无法通过且旧路径 `points.size() >= 3` 时，保持原折线中段不变，仅正交修正首尾拐点衔接新引脚位置并复验。
 3. **局部窗口迭代补障 + 求解器调用（`RouteMethod::kNative`）**：
    * 初始窗口取起止点包围盒外扩 `padding + buffer`，随后每轮重试按 `padding * 2^attempt` 扩张（最多 `retries` 轮）。
@@ -72,9 +80,10 @@ qt_demo/
 1. **非均匀正交坐标离散化**：
    * 收集起止引脚精确坐标、所有局部障碍物按动态有效缓冲膨胀后的边界 `rect.Pad(eff_buf)` 及外围逃逸环，排序去重并保护引脚坐标不漂移。
    * 当坐标数 `< 200` 时，按空隙宽度优先向大通道注入中点（上限 `240`），使路径自然走通道中央而非紧贴模块边缘。
-2. **微秒级二维阻塞位图（`edge_h` / `edge_v`）**：
+2. **微秒级二维阻塞位图（`edge_h` / `edge_v`）与拥挤度软惩罚（`kEdgeWireOccupied`）**：
    * 针对每个障碍物膨胀框，用二分定位其覆盖的网格区间并标记位掩码（`kBlkOther`、`kBlkSrc`、`kBlkDst`、`kEdgeBorder`）。
    * 预计算起点沿 `sp.dirs` 离开 `src` 缓冲框、终点沿 `dp.dirs` 离开 `dst` 缓冲框的合法逃逸射线，禁止在起止缓冲框内部提前拐弯，同时绝不豁免任何第三方障碍。
+   * **窄缝多线拥挤度软惩罚**：当 `Request::occupied_wires` 非空且 `Config::wire_overlap_penalty > 0.0` 时，求解器先对直连快路径执行不同源共线重叠校验，再遍历 `occupied_wires`（跳过同源 `NetKey {src, sp}`）用二分定位覆盖的 `edge_h`/`edge_v` 微段置位 `kEdgeWireOccupied = 16`，并在状态转移及出/入逃逸段叠加非负软代价 `+ cfg.wire_overlap_penalty`（保持启发式 `h` 严格可采纳）。为守住万级 10k 拖拽 `< 5.0 ms` 性能红线，`RouteAllParallel` 与高频 `RerouteAffected` 交互拖拽保持 `occupied_wires = nullptr` 零开销，仅在 `AutoRouteConnectors` 显式整理（或直接传入 `Request::occupied_wires`）时启用。
 3. **带方向状态与最小拐点启发式（`MinRemainingBends`）**：
    * 搜索状态编码为 `((iy * w + ix) << 2) | dir_idx`（4 方向：`kUp/kDown/kLeft/kRight`，禁止 180° 掉头）。
    * 通过四方向坐标旋转将目标入口方向统一映射到 `+X`，按位移与当前朝向奇偶性精确计算最少剩余拐点数（0–4 拐），启发式 `h = manhattan + min_bends * penalty` 严格可采纳。
@@ -89,8 +98,8 @@ qt_demo/
 为消除多条独立连线走中间通道时重合叠成单线（如平行对连母线、级联走廊重叠）的问题，系统在 `Config::enable_channel_nudging = true` 时于单次重算/冷启动末尾执行轻量级 $O(K \log K)$ 通道分轨（支持通过 `LocalOrthogonalRouter::set_enable_channel_nudging(bool)` 与 `AsyncLocalRouter::set_enable_channel_nudging(bool)` 运行时切换）：
 
 1. **活动线与只读锚定线严格隔离（`mutable_conns` vs Fixed Anchors）**：
-   * 全图冷启动（`RouteAllParallel` 合并后，`full_graph = true`）：全图 `Status::kValid` 连线均属于可移动集，按确定性升序 `Id` 执行单趟全图等距分轨。
-   * 交互拖拽与局部编辑（`RerouteAffected`、`RouteConnector` 及 `AsyncLocalRouter::Poll` 局部收口，`full_graph = false`）：仅本次重算的直连线集为 `mutable_conns`；联合包围盒外扩 `max(2 * nudge_distance, 80.0)` 查询到的邻近非关联连线（参与上限 `256` 条）**仅作为只读占用轨道（Fixed Anchors）参与冲突检测与避让**，严禁修改任何非 `mutable_conns` 连线，确保拖拽时非关联线 100% 静止。
+   * 全图冷启动（`RouteAllParallel` 合并后，`full_graph = true`）：全图 `Status::kValid` 且 `user_modified == false` 的连线属于可移动集，按确定性升序 `Id` 执行单趟全图等距分轨；凡 `user_modified == true` 的连线在全图与局部模式下均作为只读锚定轨道（Fixed Anchors），不被擅自挪动。
+   * 交互拖拽与局部编辑（`RerouteAffected`、`RouteConnector`、`AutoRouteConnectors` 及 `AsyncLocalRouter::Poll` 局部收口，`full_graph = false`）：仅本次重算且未锁定（`!user_modified`）的直连线集为 `mutable_conns`；联合包围盒外扩 `max(2 * nudge_distance, 80.0)` 查询到的邻近非关联连线（参与上限 `256` 条）及所有 `user_modified == true` 连线**仅作为只读占用轨道（Fixed Anchors）参与冲突检测与避让**，严禁修改任何非 `mutable_conns` 或手动锁定连线，确保拖拽时非关联线与手调线 100% 静止。
 2. **中间段与电气网表语义（`NetKey`）**：仅平移 `pts.size() >= 4` 连线的中间正交段（索引 `[1, pts.size() - 3]`），绝不篡改起止引脚位置与出线方向；按 `NetKey { src_block, src_pin }` 归组——**同一源引脚扇出允许共享主干，不同 `NetKey` 独立信号强制分轨**（同源固定线已存在时新扇出优先锚定其主干）。
 3. **坐标带分桶 + 区间冲突聚类 + 固定轨道避让分配**：分别处理垂直与水平中间段；冷启动按 `<= 1.5 px` 聚合共线坐标带，交互态按 `< nudge_distance` 收集冲突簇。若簇内均为可动线且不撞固定轨道，按 Minimal-Crossing 排序在 `[free_min, free_max]` 内居中均匀摊开；当可动线与只读固定线坐标差 `< nudge_distance - 1e-3` 且区间重叠时，固定线纹丝不动，可动线按**最小交叉优先 + 距原坐标最近 + 与全部重叠固定线/已放轨道间距 `>= nudge_distance`** 的准则落位至空闲轨道。
 4. **安全净宽夹紧 + 逐线全局复验回滚**：通过 `SpatialGridIndex::Query` 找出同跨度左右/上下障碍物膨胀框及相邻拐点约束得到安全通道 `[free_min, free_max]`（空间极窄不足 `2 * nudge_distance` 时自动选择最大净空子隙中心）；每条调整后走 `ValidateAndSimplifyRoute()` 全量碰撞与正交复验，若任一线冲突仅单线回滚，**100% 保留原有 `Valid` 合法率**。
@@ -100,6 +109,17 @@ qt_demo/
 * **双副本状态隔离**：主线程（Owner）仅操作 `model_`，后台工作线程独享一份独立的 `LocalOrthogonalRouter` 副本，彻底避免读写锁竞争或工作线程触碰 UI 数据。
 * **拖动合并与代际丢弃**：高频拖动调用 `Move()` 时，同模块多次位移直接合并覆盖到 `edits_` 表并递增 `generation_`；后台计算完毕提交结果时，若结果所属代际已落后于当前最新位置，自动丢弃过期路径。
 * **视口与选区优先**：调用 `Prioritize(viewport, selection)` 后，后台队列优先处理当前选中块和可见区域内的连线；单波次 `pending_` 清空时在 Owner 侧收口触发局部/全图 `ChannelNudger`。
+* **手动调线与显式整理透传**：`MoveRouteSegment()` 与 `AutoRouteConnectors()` 立即同步更新 Owner `model_`，并通过 `route_overrides_` 与递增 `generation_` 通知后台 `snapshot` 同步状态并丢弃过期在途结果。
+
+### 3.6 局部焊点检测与手动调线（`ComputeSolderJoints` / `MoveRouteSegment` / `AutoRouteConnectors`）
+
+1. **按视口局部计算同源分叉焊点（`ComputeSolderJoints(conn_ids)`）**：
+   * 纯只读局部查询接口（仅扫描调用方传入的当前视口可见连线子集，绝不扫描全图）：先过滤 `Status::kValid` 且点数 `>= 2` 的连线，按 `(src, sp)` 排序归组，对单线组直接零分配跳过。
+   * 对多线同源组提取水平/垂直线段，检出三类电气分叉点（排除引脚起终点本身）：**T 型分叉点**（一方内顶点严格落在另一方线段内部）、**共享段分叉端点**（共线重叠区间端点处两条线朝不同方向离开）、**同源十字交点**（同源水平段与垂直段严格内部相交）；结果按 `1e-3` 容差去重。不同源（不同 `(src, sp)`）交叉绝不产生焊点。
+2. **手动拖拽连线线段（`MoveRouteSegment(conn_id, seg_index, new_coord)`）**：
+   * 拖动中间段（`1 <= seg_index <= pts.size() - 3`）时仅平移该段端点坐标，绝不改动首尾引脚；若拖动 2 点直连或首/末段，自动插入正交折弯使其包含中间段并保持引脚合法出线方向，清理退化共线点后置位 `user_modified = true` 与 `RouteMethod::kReuse`（碰撞障碍时按实际几何置为 `Status::kDisplayOnly`，绝不强行弹回破坏用户意图）。
+3. **显式整理连线（`AutoRouteConnectors(conn_ids)`）**：
+   * 清除指定连线的 `user_modified = false`，跳过 `kReuse` 并采集局部邻近不同源 `Status::kValid` 线段（上限 `128` 条）传入 `Request::occupied_wires` 执行避障与拥挤分流求解，随后运行局部 `ChannelNudger` 完成等距分轨。
 
 ## 4. 核心数据结构与配置参考
 
@@ -109,6 +129,7 @@ qt_demo/
 * **`Direction`**：位掩码枚举 `kUp = 1`, `kDown = 2`, `kLeft = 4`, `kRight = 8`，可按位或组合。
 * **`Pin { Id id; double x, y; unsigned dirs; }`**: `x, y` 为相对模块矩形的 `[0.0, 1.0]` 归一化坐标；支持多条连线共享同一引脚扇出。
 * **`Block { Id id; Rect rect; std::vector<Pin> pins; }`**、**`Conn { Id id, src, sp, dst, dp; }`**。
+* **`OccupiedSegment { Point u, v; Id src_block, src_pin; }`** 与 **`Request::occupied_wires`**：可选的只读邻近他线线段视图（默认 `nullptr`），用于求解器在显式整理时规避不同源拥挤通道，同源 `(src_block, src_pin)` 不受惩罚。
 
 ### 4.2 路由器配置 `localroute::Config`
 
@@ -126,8 +147,11 @@ qt_demo/
 | `profile` | `false` | 是否记录 `Route::profile` 分项耗时（建图、搜索、查询、复验） |
 | `reroute_third_party_blocked` | `false` | **默认关闭**：关闭时移模块压到无关线不重算（允许穿模）；开启时维护线段索引并重算被挡第三方线 |
 | `enable_channel_nudging` | `true` | **默认开启**：是否启用局部通道等距分轨（支持 `set_enable_channel_nudging(bool)` 实时切换） |
+| `wire_overlap_penalty` | `25.0` | 窄缝多线共线重合软惩罚权重（设为 `0.0` 时关闭拥挤检测） |
 
-### 4.3 路由结果状态 `Status` 与 `Outcome`
+### 4.3 路由结果状态 `Status`、`Outcome` 与锁定标志
+
+* **`Route::user_modified`**（`bool`，默认 `false`）：由 `MoveRouteSegment()` 置位，表示该路径含用户手动拖拽调整的线段，后续增量重算优先保留其中段且 `ChannelNudger` 不擅自移动；调用 `AutoRouteConnectors()` 或中段碰撞障碍回退重算后清除。
 
 * **`Status::kValid`**：通过全部几何、方向与全局障碍复验的合法正交折线。
 * **`Status::kPending`**：异步模式或脏标等待重算中（可配合 `Preview(id)` 或保留的旧点列绘制虚线预览）。
@@ -177,6 +201,11 @@ for (localroute::Id cid : changed) {
   const localroute::Route& r = router.route(cid);
   // r.status == Status::kValid 时，r.points 为严格正交折线点列
 }
+
+// 4. 手动微调连线线段、计算视口焊点与显式 Auto-route 恢复
+router.MoveRouteSegment(101, /*seg_index=*/1, /*new_coord=*/180.0);
+std::vector<localroute::Point> solder_joints = router.ComputeSolderJoints({101});
+router.AutoRouteConnectors({101});
 ```
 
 ### 5.3 异步模式接入示例（推荐用于万级节点 Qt / 桌面 GUI）
@@ -238,6 +267,9 @@ localroute::LocalOrthogonalRouter router(cfg, std::make_shared<CustomSolver>());
 2. **异步拓扑变更规则**：`AsyncLocalRouter` 面向已建好拓扑的编辑会话；执行增删模块/连线等拓扑结构变更时，应先销毁旧会话（或 `Clone()` 重建后调用 `StartDirty()` / `StartAll()`）再创建新会话。
 3. **GUI 渲染与自由建模能力（`qt_demo`）**：
    * 渲染层通过 `view().QueryBlocks(viewport)` 做模块视口裁剪、为每条连线缓存包围盒做 $O(1)$ 裁剪，并在低缩放倍率下启用合批绘制与 LOD。
+   * **同源焊点与交叉跳线弧**：`zoom >= 0.25` 时调用 `view().ComputeSolderJoints(visible_conn_ids)` 绘制实心同源分叉焊点圆点；`zoom >= 0.4` 且开启工具栏 `交叉跳线弧 (Hops)`（默认勾选）时，对视口内不同源正交交叉切开水平段并绘制向上半圆跳线弧。
+   * **手动拖拽连线线段与 `Auto-route`**：`zoom >= 0.25` 时悬停连线线段（`<= 5.0 px`）切换 `Qt::SizeVerCursor` / `Qt::SizeHorCursor`，左键拖动实时调用 `MoveRouteSegment()` 并置位 `user_modified` 锁定；工具栏新增 `整理选中线 (Auto-route)` 按钮，对当前选中连线或选中模块关联连线调用 `AutoRouteConnectors()` 恢复最优避障与通道分轨。
+   * **端口对齐直线吸附（Smart Guides）**：单模块拖拽（`selected_blocks.size() == 1` 且未按住 `Alt` 键）时，直连同向端口坐标差 `<= 5.0` 自动吸附拉直并绘制淡蓝虚线参考线，松手后参考线自动消失。
    * 支持从左侧**图元库（`LibraryWidget`）**拖拽 7 类预设模块到画布（或从 `0 模块 (空白画布)` 起步），右侧面板及右键菜单支持动态修改选中模块四向端口个数（`左/右 0~16`、`上/下 0~8`），并支持悬停端口拖拽手动连线与 `Del` 删除。
    * 工具栏内置 `预设: B1-B2 10线平行对连` 与 `预设: B9/B3/B8 级联布线` 视觉验收场景，配合 `通道分轨 (Nudging)` 复选框可一键开关对比分轨效果；默认以普通深蓝线条绘制 `Status::kDisplayOnly` 兜底线以对齐 Simulink 视觉观感，同时提供 `高亮兜底线 (Debug)` 复选框（默认关闭）支持橙色高亮调试。
 4. **近距模块缓冲**：若业务画布允许两个相连模块间距小于 `2 * cfg.buffer`（默认 `16 px`），建议将 `cfg.buffer` 调至 `4.0 ~ 6.0` 以减少缓冲框互叠导致的 `Status::kDisplayOnly` 退化。
@@ -248,8 +280,9 @@ localroute::LocalOrthogonalRouter router(cfg, std::make_shared<CustomSolver>());
 
 | 场景（10,000 模块 / 20,000 连线） | 指标 | 实测表现 |
 | :--- | :--- | :--- |
-| 同步 4 线程全图冷启动 | 总耗时 / 合法率 | **2.38 s**（`2377.42 ms`） / **99.53%**（19,906 Valid, 94 DisplayOnly, 0 Failed） |
-| 同步单模块拖拽（200 帧） | P50 / P99 | **0.404 ms** / **3.635 ms**（非关联线误提交 0） |
-| 同步 20 模块框选拖拽（200 帧） | P50 / P99 | **1.687 ms** / **3.982 ms** |
-| 同步穿插密集连线区（200 帧） | P50 / P99 | **0.682 ms** / **1.883 ms**（非关联线误提交 0） |
-| `qt_demo` Async 10k 交互冒烟 | `Route Time` / `Paint Time` | **0.017 ~ 0.057 ms** / **7.07 ~ 10.16 ms** |
+| 同步 4 线程全图冷启动 | 总耗时 / 合法率 | **2.54 s**（`2540.68 ms`） / **99.53%**（19,906 Valid, 94 DisplayOnly, 0 Failed） |
+| 同步单模块拖拽（200 帧） | P50 / P99 | **0.393 ms** / **4.432 ms**（非关联线误提交 0） |
+| 同步 20 模块框选拖拽（200 帧） | P50 / P99 | **1.763 ms** / **4.741 ms** |
+| 同步穿插密集连线区（200 帧） | P50 / P99 | **0.699 ms** / **9.662 ms**（P95 `2.713 ms`，非关联线误提交 0） |
+| `qt_demo` Async 10k 交互冒烟（含焊点+跳线弧） | `Route Time` / `Paint Time` | **0.021 ~ 0.056 ms** / **6.41 ~ 8.38 ms** |
+| `qt_demo` Sync 10k 局部渲染（含焊点+跳线弧） | `Paint Time` | **8.87 ~ 9.27 ms** |

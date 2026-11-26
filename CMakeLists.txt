@@ -39,6 +39,10 @@ if(LOCALROUTE_BUILD_TESTS)
         ChannelNudgingParallelBundle
         ChannelNudgingCascadeAndNoHook
         NarrowGapObstacleAvoidance
+        SolderJointDetection
+        ManualSegmentDragAndPreserve
+        AutoRouteSelectedLines
+        WireCongestionSoftPenalty
     )
         add_test(NAME local.${t} COMMAND test_unit ${t})
     endforeach()

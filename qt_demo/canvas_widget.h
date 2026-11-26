@@ -35,6 +35,8 @@ class CanvasWidget : public QWidget {
   void SetRerouteThirdPartyBlocked(bool enabled);
   void SetEnableChannelNudging(bool enabled);
   void SetHighlightFallback(bool enabled);
+  void SetShowLineHops(bool enabled);
+  std::vector<localroute::Id> AutoRouteSelection();
   void RouteAll();
   void FitAll();
   void ResetLocalView();
@@ -58,6 +60,7 @@ class CanvasWidget : public QWidget {
   bool reroute_third_party_blocked() const { return third_party_reroute_; }
   bool enable_channel_nudging() const { return channel_nudging_; }
   bool highlight_fallback() const { return highlight_fallback_; }
+  bool show_line_hops() const { return show_line_hops_; }
   std::size_t selected_block_count() const { return selected_blocks_.size(); }
   bool has_selected_conn() const { return has_selected_conn_; }
   const localroute::LocalOrthogonalRouter& router_view() const {
@@ -71,6 +74,10 @@ class CanvasWidget : public QWidget {
   std::size_t last_visible_conns() const { return visible_conn_count_; }
   void StepSmokeDrag(const std::vector<localroute::Id>& ids, double dx,
                      double dy);
+  bool StepSmokeSegmentDrag(localroute::Id conn_id, std::size_t seg_index,
+                            double new_coord);
+  std::vector<localroute::Id> StepSmokeAutoRoute(
+      const std::vector<localroute::Id>& conn_ids);
 
  signals:
   void StatusChanged();
@@ -108,7 +115,21 @@ class CanvasWidget : public QWidget {
     localroute::Point world_pos{0.0, 0.0};
   };
 
-  enum class DragKind { kNone, kPan, kMoveBlocks, kRubberBand, kWiring };
+  enum class DragKind {
+    kNone,
+    kPan,
+    kMoveBlocks,
+    kRubberBand,
+    kWiring,
+    kMoveSegment
+  };
+
+  struct SmartGuideLine {
+    bool is_vertical = false;
+    double coord = 0.0;
+    double span0 = 0.0;
+    double span1 = 0.0;
+  };
 
   const localroute::LocalOrthogonalRouter& ActiveView() const;
   void InstallInitialRouter(localroute::LocalOrthogonalRouter initial);
@@ -127,12 +148,17 @@ class CanvasWidget : public QWidget {
   PinHit HitTestPin(const QPointF& screen_pos, double max_px = 12.0) const;
   bool HitTestWire(const QPointF& screen_pos,
                    localroute::Id* out_conn_id) const;
+  bool HitTestWireSegment(const QPointF& screen_pos,
+                          localroute::Id* out_conn_id,
+                          std::size_t* out_seg_index,
+                          bool* out_is_vertical) const;
   void DrawHud(QPainter* painter);
 
   RouteMode mode_ = RouteMode::kAsync;
   bool third_party_reroute_ = false;
   bool channel_nudging_ = true;
   bool highlight_fallback_ = false;
+  bool show_line_hops_ = true;
   unsigned current_block_count_ = 0;
   unsigned current_conn_count_ = 0;
   localroute::Id next_block_id_ = 1;
@@ -159,6 +185,12 @@ class CanvasWidget : public QWidget {
   std::unordered_set<localroute::Id> highlighted_conns_;
   bool has_selected_conn_ = false;
   localroute::Id selected_conn_id_ = 0;
+
+  // Segment drag & Smart Guides state
+  localroute::Id drag_seg_conn_id_ = 0;
+  std::size_t drag_seg_index_ = 0;
+  bool drag_seg_is_vertical_ = false;
+  std::vector<SmartGuideLine> active_guides_;
 
   // Interactive wiring & library drop ghost state
   PinHit hover_pin_;

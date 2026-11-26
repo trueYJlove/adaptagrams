@@ -244,6 +244,92 @@ std::vector<Point> MakeSimulinkFallback(Point a, Point b, const Block& src,
   return SimplifyOrtho({a, {a.x, y_out}, {x_in, y_out}, {x_in, b.y}, b});
 }
 
+bool SegmentsCollinearOverlap(Point a0, Point a1, Point b0, Point b1,
+                              double match_eps) {
+  if (std::abs(a0.y - a1.y) <= 1e-6 && std::abs(b0.y - b1.y) <= 1e-6) {
+    if (std::abs(a0.y - b0.y) > match_eps) {
+      return false;
+    }
+    const double ov0 = std::max(std::min(a0.x, a1.x), std::min(b0.x, b1.x));
+    const double ov1 = std::min(std::max(a0.x, a1.x), std::max(b0.x, b1.x));
+    return ov1 - ov0 > 1e-3;
+  }
+  if (std::abs(a0.x - a1.x) <= 1e-6 && std::abs(b0.x - b1.x) <= 1e-6) {
+    if (std::abs(a0.x - b0.x) > match_eps) {
+      return false;
+    }
+    const double ov0 = std::max(std::min(a0.y, a1.y), std::min(b0.y, b1.y));
+    const double ov1 = std::min(std::max(a0.y, a1.y), std::max(b0.y, b1.y));
+    return ov1 - ov0 > 1e-3;
+  }
+  return false;
+}
+
+bool RouteOverlapsOccupied(const std::vector<Point>& pts,
+                           const std::vector<OccupiedSegment>& occupied,
+                           double match_eps) {
+  for (std::size_t j = 1; j < pts.size(); ++j) {
+    for (const auto& occ : occupied) {
+      if (SegmentsCollinearOverlap(pts[j - 1], pts[j], occ.u, occ.v,
+                                   match_eps)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+std::vector<OccupiedSegment> CollectOccupiedForBlocks(
+    const Conn& target, const std::vector<Id>& block_ids,
+    const std::unordered_map<Id, Conn>& conns,
+    const std::unordered_map<Id, std::vector<Id>>& adjacent,
+    const std::unordered_map<Id, Route>& routes, std::size_t max_segments) {
+  std::vector<Id> cand_conns;
+  cand_conns.reserve(block_ids.size() * 4);
+  for (Id bid : block_ids) {
+    const auto ait = adjacent.find(bid);
+    if (ait != adjacent.end()) {
+      cand_conns.insert(cand_conns.end(), ait->second.begin(),
+                        ait->second.end());
+    }
+  }
+  std::sort(cand_conns.begin(), cand_conns.end());
+  cand_conns.erase(std::unique(cand_conns.begin(), cand_conns.end()),
+                   cand_conns.end());
+
+  std::vector<OccupiedSegment> out;
+  out.reserve(std::min<std::size_t>(max_segments, cand_conns.size() * 3));
+  for (Id cid : cand_conns) {
+    if (cid == target.id) {
+      continue;
+    }
+    const auto cit = conns.find(cid);
+    if (cit == conns.end()) {
+      continue;
+    }
+    const Conn& other = cit->second;
+    if (other.src == target.src && other.sp == target.sp) {
+      continue;
+    }
+    const auto rit = routes.find(cid);
+    if (rit == routes.end() || rit->second.status != Status::kValid ||
+        rit->second.points.size() < 2) {
+      continue;
+    }
+    const auto& pts = rit->second.points;
+    for (std::size_t j = 1; j < pts.size(); ++j) {
+      if (pts[j - 1] == pts[j]) {
+        continue;
+      }
+      out.push_back({pts[j - 1], pts[j], other.src, other.sp});
+      if (out.size() >= max_segments) {
+        return out;
+      }
+    }
+  }
+  return out;
+}
+
 }  // namespace
 
 LocalOrthogonalRouter::LocalOrthogonalRouter(
@@ -255,7 +341,8 @@ LocalOrthogonalRouter::LocalOrthogonalRouter(
   if (!(cfg.cell >= 1.0 && cfg.padding > 0.0 && cfg.padding <= 1e5 &&
         cfg.buffer >= 0.0 && cfg.buffer <= 1e4 && cfg.penalty > 0.0 &&
         std::isfinite(cfg.penalty) && cfg.nudge_distance > 0.0 &&
-        std::isfinite(cfg.nudge_distance) && cfg.budget >= 2 &&
+        std::isfinite(cfg.nudge_distance) && cfg.wire_overlap_penalty >= 0.0 &&
+        std::isfinite(cfg.wire_overlap_penalty) && cfg.budget >= 2 &&
         cfg.retries <= 8)) {
     throw std::invalid_argument("invalid local router config");
   }
@@ -496,7 +583,9 @@ void LocalOrthogonalRouter::Publish(Id id, Route route) {
   dirty_.erase(id);
 }
 
-Route LocalOrthogonalRouter::SolveOne(const Conn& c, bool settled) const {
+Route LocalOrthogonalRouter::SolveOne(const Conn& c, bool settled,
+                                      bool force_auto_route,
+                                      bool allow_congestion) const {
   const auto& src = blocks_.at(c.src);
   const auto& dst = blocks_.at(c.dst);
   const Pin sp = FindPin(src, c.sp);
@@ -624,31 +713,95 @@ Route LocalOrthogonalRouter::SolveOne(const Conn& c, bool settled) const {
     return true;
   };
 
-  if (cfg_.fast_paths && !(settled && cfg_.settle_nudge)) {
-    const auto it = routes_.find(c.id);
-    const bool has_old =
-        it != routes_.end() && it->second.method != RouteMethod::kNone;
-    // 1. Whole-polyline translation reuse.
-    if (has_old) {
-      const auto& p = it->second.points;
-      const double dx = a.x - p.front().x;
-      const double dy = a.y - p.front().y;
-      if (dx == b.x - p.back().x && dy == b.y - p.back().y) {
-        auto moved = p;
-        for (auto& v : moved) {
-          v = {v.x + dx, v.y + dy};
-        }
-        moved.front() = a;
-        moved.back() = b;
-        if (accept(std::move(moved), RouteMethod::kReuse)) {
-          return out;
-        }
+  const auto old_it = routes_.find(c.id);
+  const bool has_old = old_it != routes_.end() &&
+                       old_it->second.points.size() >= 2 &&
+                       old_it->second.method != RouteMethod::kNone;
+
+  auto try_translation_reuse = [&](bool preserve_user_mod) {
+    if (!has_old) {
+      return false;
+    }
+    const auto& p = old_it->second.points;
+    const double dx = a.x - p.front().x;
+    const double dy = a.y - p.front().y;
+    if (dx == b.x - p.back().x && dy == b.y - p.back().y) {
+      auto moved = p;
+      for (auto& v : moved) {
+        v = {v.x + dx, v.y + dy};
+      }
+      moved.front() = a;
+      moved.back() = b;
+      if (accept(std::move(moved), RouteMethod::kReuse)) {
+        out.user_modified = preserve_user_mod;
+        return true;
       }
     }
+    return false;
+  };
+
+  auto try_endpoint_patch_reuse = [&](bool preserve_user_mod) {
+    if (!has_old) {
+      return false;
+    }
+    const auto& p = old_it->second.points;
+    if (p.size() < 3) {
+      return false;
+    }
+    auto repair = [&](Point end, Point old_end, Point bend) {
+      return end == old_end ? bend
+                            : (old_end.y == bend.y ? Point{bend.x, end.y}
+                                                   : Point{end.x, bend.y});
+    };
+    const Point first = repair(a, p.front(), p[1]);
+    const Point last = repair(b, p.back(), p[p.size() - 2]);
+    std::vector<Point> patch{a, first};
+    if (p.size() == 3) {
+      patch.push_back(p[1]);
+    } else {
+      patch.insert(patch.end(), p.begin() + 2, p.end() - 2);
+    }
+    patch.push_back(last);
+    patch.push_back(b);
+    if (accept(std::move(patch), RouteMethod::kReuse)) {
+      out.user_modified = preserve_user_mod;
+      return true;
+    }
+    return false;
+  };
+
+  // Minimum disturbance: respect hand-edited segments ahead of Simple L/Z.
+  if (!force_auto_route && has_old && old_it->second.user_modified) {
+    if (try_translation_reuse(true) || try_endpoint_patch_reuse(true)) {
+      return out;
+    }
+  }
+
+  const double wire_match_eps = std::min(1.5, cfg_.nudge_distance * 0.25);
+  std::vector<OccupiedSegment> precollected_occupied;
+  if (force_auto_route && cfg_.wire_overlap_penalty > 0.0) {
+    const std::vector<Id> nearby_blocks =
+        query(Box(a, b).Pad(cfg_.padding + cfg_.buffer));
+    precollected_occupied = CollectOccupiedForBlocks(c, nearby_blocks, conns_,
+                                                     adjacent_, routes_, 128);
+  }
+  auto accept_simple = [&](std::vector<Point> p) {
+    if (force_auto_route && !precollected_occupied.empty() &&
+        RouteOverlapsOccupied(p, precollected_occupied, wire_match_eps)) {
+      return false;
+    }
+    return accept(std::move(p), RouteMethod::kSimple);
+  };
+
+  if (cfg_.fast_paths &&
+      (force_auto_route || !(settled && cfg_.settle_nudge))) {
+    // 1. Whole-polyline translation reuse.
+    if (!force_auto_route && try_translation_reuse(false)) {
+      return out;
+    }
     // 2. Clean 2/3-segment L and Z Simple candidates (eliminates stale hooks).
-    if (accept(Elbow(a, b, true), RouteMethod::kSimple) ||
-        (a.x != b.x && a.y != b.y &&
-         accept(Elbow(a, b, false), RouteMethod::kSimple))) {
+    if (accept_simple(Elbow(a, b, true)) ||
+        (a.x != b.x && a.y != b.y && accept_simple(Elbow(a, b, false)))) {
       return out;
     }
     if (a.y != b.y && (sp.dirs & (kLeft | kRight)) &&
@@ -656,7 +809,7 @@ Route LocalOrthogonalRouter::SolveOne(const Conn& c, bool settled) const {
       for (double x :
            {(a.x + b.x) * 0.5, std::clamp((a.x + b.x) * 0.5, aa.l, aa.r),
             std::clamp((a.x + b.x) * 0.5, bb.l, bb.r)}) {
-        if (accept({a, {x, a.y}, {x, b.y}, b}, RouteMethod::kSimple)) {
+        if (accept_simple({a, {x, a.y}, {x, b.y}, b})) {
           return out;
         }
       }
@@ -665,35 +818,15 @@ Route LocalOrthogonalRouter::SolveOne(const Conn& c, bool settled) const {
       for (double y :
            {(a.y + b.y) * 0.5, std::clamp((a.y + b.y) * 0.5, aa.t, aa.b),
             std::clamp((a.y + b.y) * 0.5, bb.t, bb.b)}) {
-        if (accept({a, {a.x, y}, {b.x, y}, b}, RouteMethod::kSimple)) {
+        if (accept_simple({a, {a.x, y}, {b.x, y}, b})) {
           return out;
         }
       }
     }
     // 3. Fallback: patch endpoints onto previous middle segments when Simple is
     //    blocked by obstacles.
-    if (has_old) {
-      const auto& p = it->second.points;
-      if (p.size() >= 3) {
-        auto repair = [&](Point end, Point old_end, Point bend) {
-          return end == old_end ? bend
-                                : (old_end.y == bend.y ? Point{bend.x, end.y}
-                                                       : Point{end.x, bend.y});
-        };
-        const Point first = repair(a, p.front(), p[1]);
-        const Point last = repair(b, p.back(), p[p.size() - 2]);
-        std::vector<Point> patch{a, first};
-        if (p.size() == 3) {
-          patch.push_back(p[1]);
-        } else {
-          patch.insert(patch.end(), p.begin() + 2, p.end() - 2);
-        }
-        patch.push_back(last);
-        patch.push_back(b);
-        if (accept(std::move(patch), RouteMethod::kReuse)) {
-          return out;
-        }
-      }
+    if (!force_auto_route && try_endpoint_patch_reuse(false)) {
+      return out;
     }
   }
 
@@ -743,8 +876,28 @@ Route LocalOrthogonalRouter::SolveOne(const Conn& c, bool settled) const {
         std::max<unsigned>(out.window, static_cast<unsigned>(obs.size()));
     out.retries = attempt;
     ++out.calls;
-    if (accept(solver_->Solve(
-                   {cfg_, c, obs, settled && cfg_.settle_nudge, profile}),
+
+    const std::vector<OccupiedSegment>* occ_ptr = nullptr;
+    std::vector<OccupiedSegment> local_occupied;
+    if (force_auto_route && cfg_.wire_overlap_penalty > 0.0) {
+      occ_ptr =
+          precollected_occupied.empty() ? nullptr : &precollected_occupied;
+    } else if (allow_congestion && cfg_.wire_overlap_penalty > 0.0 &&
+               obs.size() <= 60) {
+      std::vector<Id> obs_ids;
+      obs_ids.reserve(obs.size());
+      for (const Block* b_obs : obs) {
+        obs_ids.push_back(b_obs->id);
+      }
+      local_occupied =
+          CollectOccupiedForBlocks(c, obs_ids, conns_, adjacent_, routes_, 128);
+      if (!local_occupied.empty()) {
+        occ_ptr = &local_occupied;
+      }
+    }
+
+    if (accept(solver_->Solve({cfg_, c, obs, settled && cfg_.settle_nudge,
+                               profile, occ_ptr}),
                RouteMethod::kNative)) {
       return out;
     }
@@ -766,7 +919,8 @@ std::vector<Id> LocalOrthogonalRouter::RerouteAffected(
     }
   }
   for (Id id : ids) {
-    Publish(id, SolveOne(conns_.at(id), settled));
+    Publish(id, SolveOne(conns_.at(id), settled, /*force_auto_route=*/false,
+                         /*allow_congestion=*/false));
   }
   if (cfg_.enable_channel_nudging && !ids.empty()) {
     (void)ApplyChannelNudging({ids.begin(), ids.end()}, false);
@@ -775,7 +929,8 @@ std::vector<Id> LocalOrthogonalRouter::RerouteAffected(
 }
 
 void LocalOrthogonalRouter::RouteConnector(Id id) {
-  Publish(id, SolveOne(conns_.at(id), false));
+  Publish(id, SolveOne(conns_.at(id), false, /*force_auto_route=*/false,
+                       /*allow_congestion=*/false));
   if (cfg_.enable_channel_nudging) {
     (void)ApplyChannelNudging({id}, false);
   }
@@ -784,6 +939,481 @@ void LocalOrthogonalRouter::RouteConnector(Id id) {
 void LocalOrthogonalRouter::MarkConnector(Id id) {
   (void)conns_.at(id);
   Mark(id);
+}
+
+bool LocalOrthogonalRouter::MoveRouteSegment(Id conn_id, std::size_t seg_index,
+                                             double new_coord) {
+  if (!std::isfinite(new_coord)) {
+    return false;
+  }
+  const auto cit = conns_.find(conn_id);
+  const auto rit = routes_.find(conn_id);
+  if (cit == conns_.end() || rit == routes_.end() ||
+      rit->second.points.size() < 2) {
+    return false;
+  }
+  const Conn& conn = cit->second;
+  const auto& src = blocks_.at(conn.src);
+  const auto& dst = blocks_.at(conn.dst);
+  const Pin sp = FindPin(src, conn.sp);
+  const Pin dp = FindPin(dst, conn.dp);
+  const Point a = PinPosition(src.rect, sp);
+  const Point b = PinPosition(dst.rect, dp);
+  const std::vector<Point>& old_pts = rit->second.points;
+  if (seg_index + 1 >= old_pts.size()) {
+    return false;
+  }
+  const Point u = old_pts[seg_index];
+  const Point v = old_pts[seg_index + 1];
+  const unsigned dir = OrthoDir(u, v);
+  if (!dir) {
+    return false;
+  }
+  const bool is_vert = (dir & (kUp | kDown)) != 0;
+  std::vector<Point> cand;
+
+  if (old_pts.size() >= 4 && seg_index >= 1 && seg_index + 2 < old_pts.size()) {
+    cand = old_pts;
+    if (is_vert) {
+      cand[seg_index].x = new_coord;
+      cand[seg_index + 1].x = new_coord;
+    } else {
+      cand[seg_index].y = new_coord;
+      cand[seg_index + 1].y = new_coord;
+    }
+  } else if (old_pts.size() == 2) {
+    if (is_vert) {
+      if ((sp.dirs & (kLeft | kRight)) && (dp.dirs & (kLeft | kRight))) {
+        cand = {a, {new_coord, a.y}, {new_coord, b.y}, b};
+      } else {
+        const double span = std::abs(b.y - a.y);
+        double y_exit = a.y;
+        double y_enter = b.y;
+        if (b.y > a.y + 4.0 && (sp.dirs & kDown) && (dp.dirs & kUp)) {
+          const double stub = std::min(20.0, std::max(2.0, span * 0.25));
+          y_exit = a.y + stub;
+          y_enter = b.y - stub;
+        } else if (a.y > b.y + 4.0 && (sp.dirs & kUp) && (dp.dirs & kDown)) {
+          const double stub = std::min(20.0, std::max(2.0, span * 0.25));
+          y_exit = a.y - stub;
+          y_enter = b.y + stub;
+        } else {
+          const double stub = std::max(cfg_.buffer + 4.0, 12.0);
+          y_exit = a.y + ((sp.dirs & kUp) && !(sp.dirs & kDown) ? -stub : stub);
+          y_enter =
+              b.y + ((dp.dirs & kDown) && !(dp.dirs & kUp) ? stub : -stub);
+        }
+        cand = {a,
+                {a.x, y_exit},
+                {new_coord, y_exit},
+                {new_coord, y_enter},
+                {b.x, y_enter},
+                b};
+      }
+    } else {
+      if ((sp.dirs & (kUp | kDown)) && (dp.dirs & (kUp | kDown))) {
+        cand = {a, {a.x, new_coord}, {b.x, new_coord}, b};
+      } else {
+        const double span = std::abs(b.x - a.x);
+        double x_exit = a.x;
+        double x_enter = b.x;
+        if (b.x > a.x + 4.0 && (sp.dirs & kRight) && (dp.dirs & kLeft)) {
+          const double stub = std::min(20.0, std::max(2.0, span * 0.25));
+          x_exit = a.x + stub;
+          x_enter = b.x - stub;
+        } else if (a.x > b.x + 4.0 && (sp.dirs & kLeft) && (dp.dirs & kRight)) {
+          const double stub = std::min(20.0, std::max(2.0, span * 0.25));
+          x_exit = a.x - stub;
+          x_enter = b.x + stub;
+        } else {
+          const double stub = std::max(cfg_.buffer + 4.0, 12.0);
+          x_exit =
+              a.x + ((sp.dirs & kLeft) && !(sp.dirs & kRight) ? -stub : stub);
+          x_enter =
+              b.x + ((dp.dirs & kRight) && !(dp.dirs & kLeft) ? stub : -stub);
+        }
+        cand = {a,
+                {x_exit, a.y},
+                {x_exit, new_coord},
+                {x_enter, new_coord},
+                {x_enter, b.y},
+                b};
+      }
+    }
+  } else if (seg_index == 0) {
+    cand.push_back(old_pts.front());
+    if (is_vert) {
+      const double split_y = 0.5 * (u.y + v.y);
+      cand.push_back({u.x, split_y});
+      cand.push_back({new_coord, split_y});
+      cand.push_back({new_coord, v.y});
+    } else {
+      const double split_x = 0.5 * (u.x + v.x);
+      cand.push_back({split_x, u.y});
+      cand.push_back({split_x, new_coord});
+      cand.push_back({v.x, new_coord});
+    }
+    for (std::size_t k = 2; k < old_pts.size(); ++k) {
+      cand.push_back(old_pts[k]);
+    }
+  } else {
+    for (std::size_t k = 0; k + 2 < old_pts.size(); ++k) {
+      cand.push_back(old_pts[k]);
+    }
+    if (is_vert) {
+      const double split_y = 0.5 * (u.y + v.y);
+      cand.push_back({new_coord, u.y});
+      cand.push_back({new_coord, split_y});
+      cand.push_back({v.x, split_y});
+    } else {
+      const double split_x = 0.5 * (u.x + v.x);
+      cand.push_back({u.x, new_coord});
+      cand.push_back({split_x, new_coord});
+      cand.push_back({split_x, v.y});
+    }
+    cand.push_back(old_pts.back());
+  }
+
+  cand = SimplifyOrtho(std::move(cand));
+  if (cand.size() < 2) {
+    return false;
+  }
+  for (std::size_t j = 1; j < cand.size(); ++j) {
+    if (!OrthoDir(cand[j - 1], cand[j])) {
+      return false;
+    }
+  }
+
+  Route updated = rit->second;
+  updated.method = RouteMethod::kReuse;
+  updated.user_modified = true;
+  updated.outcome = Outcome::kNone;
+  std::vector<Point> validated = cand;
+  if (ValidateAndSimplifyRoute(conn, &validated)) {
+    updated.points = std::move(validated);
+    updated.status = Status::kValid;
+  } else {
+    updated.points = std::move(cand);
+    updated.status = Status::kDisplayOnly;
+  }
+  Publish(conn_id, std::move(updated));
+  return true;
+}
+
+std::vector<Id> LocalOrthogonalRouter::AutoRouteConnectors(
+    const std::vector<Id>& conn_ids) {
+  std::set<Id> targets;
+  for (Id cid : conn_ids) {
+    if (conns_.count(cid)) {
+      targets.insert(cid);
+    }
+  }
+  if (targets.empty()) {
+    return {};
+  }
+  for (Id cid : targets) {
+    auto rit = routes_.find(cid);
+    if (rit != routes_.end()) {
+      rit->second.user_modified = false;
+    }
+  }
+  const std::vector<Id> changed(targets.begin(), targets.end());
+  for (Id cid : changed) {
+    Publish(cid, SolveOne(conns_.at(cid), /*settled=*/true,
+                          /*force_auto_route=*/true,
+                          /*allow_congestion=*/true));
+  }
+  if (cfg_.enable_channel_nudging) {
+    const std::vector<Id> nudged = ApplyChannelNudging(changed, false);
+    targets.insert(nudged.begin(), nudged.end());
+  }
+  return {targets.begin(), targets.end()};
+}
+
+std::vector<Point> LocalOrthogonalRouter::ComputeSolderJoints(
+    const std::vector<Id>& conn_ids) const {
+  if (conn_ids.size() < 2) {
+    return {};
+  }
+  std::vector<Id> unique_ids = conn_ids;
+  std::sort(unique_ids.begin(), unique_ids.end());
+  unique_ids.erase(std::unique(unique_ids.begin(), unique_ids.end()),
+                   unique_ids.end());
+
+  struct NetConn {
+    std::uint64_t key = 0;
+    Id cid = 0;
+    const std::vector<Point>* pts = nullptr;
+  };
+  std::vector<NetConn> valid_conns;
+  valid_conns.reserve(unique_ids.size());
+  for (Id cid : unique_ids) {
+    const auto cit = conns_.find(cid);
+    const auto rit = routes_.find(cid);
+    if (cit == conns_.end() || rit == routes_.end() ||
+        rit->second.status != Status::kValid || rit->second.points.size() < 2) {
+      continue;
+    }
+    const Conn& c = cit->second;
+    const std::uint64_t key = (static_cast<std::uint64_t>(c.src) << 32) | c.sp;
+    valid_conns.push_back({key, cid, &rit->second.points});
+  }
+  if (valid_conns.size() < 2) {
+    return {};
+  }
+  std::sort(valid_conns.begin(), valid_conns.end(),
+            [](const NetConn& a, const NetConn& b) {
+              return a.key != b.key ? a.key < b.key : a.cid < b.cid;
+            });
+
+  struct HorizSeg {
+    double y = 0.0;
+    double x0 = 0.0;
+    double x1 = 0.0;
+    std::size_t idx = 0;
+  };
+  struct VertSeg {
+    double x = 0.0;
+    double y0 = 0.0;
+    double y1 = 0.0;
+    std::size_t idx = 0;
+  };
+  struct WireGeom {
+    const std::vector<Point>* pts = nullptr;
+    std::vector<HorizSeg> h_segs;
+    std::vector<VertSeg> v_segs;
+  };
+
+  constexpr double kEps = 1e-3;
+  auto near_pt = [](Point a, Point b) {
+    return std::abs(a.x - b.x) <= kEps && std::abs(a.y - b.y) <= kEps;
+  };
+  auto is_terminal = [&](const std::vector<Point>& pts, Point p) {
+    return near_pt(p, pts.front()) || near_pt(p, pts.back());
+  };
+
+  auto out_dir_horiz = [&](const WireGeom& wg, const HorizSeg& s, double px,
+                           unsigned away_dir) -> unsigned {
+    if (s.x0 + kEps < px && px < s.x1 - kEps) {
+      return away_dir;
+    }
+    const auto& pts = *wg.pts;
+    const Point p{px, s.y};
+    std::size_t v_idx = s.idx;
+    std::size_t inside_idx = s.idx + 1;
+    if (near_pt(pts[s.idx + 1], p)) {
+      v_idx = s.idx + 1;
+      inside_idx = s.idx;
+    }
+    if (v_idx == 0 || v_idx + 1 == pts.size()) {
+      return 0;
+    }
+    const std::size_t other_idx =
+        (inside_idx == v_idx + 1) ? (v_idx - 1) : (v_idx + 1);
+    return OrthoDir(pts[v_idx], pts[other_idx]);
+  };
+
+  auto out_dir_vert = [&](const WireGeom& wg, const VertSeg& s, double py,
+                          unsigned away_dir) -> unsigned {
+    if (s.y0 + kEps < py && py < s.y1 - kEps) {
+      return away_dir;
+    }
+    const auto& pts = *wg.pts;
+    const Point p{s.x, py};
+    std::size_t v_idx = s.idx;
+    std::size_t inside_idx = s.idx + 1;
+    if (near_pt(pts[s.idx + 1], p)) {
+      v_idx = s.idx + 1;
+      inside_idx = s.idx;
+    }
+    if (v_idx == 0 || v_idx + 1 == pts.size()) {
+      return 0;
+    }
+    const std::size_t other_idx =
+        (inside_idx == v_idx + 1) ? (v_idx - 1) : (v_idx + 1);
+    return OrthoDir(pts[v_idx], pts[other_idx]);
+  };
+
+  std::vector<Point> raw_joints;
+  std::vector<WireGeom> wires;
+  for (std::size_t g_start = 0; g_start < valid_conns.size();) {
+    const std::uint64_t group_key = valid_conns[g_start].key;
+    std::size_t g_end = g_start + 1;
+    while (g_end < valid_conns.size() && valid_conns[g_end].key == group_key) {
+      ++g_end;
+    }
+    if (g_end - g_start < 2) {
+      g_start = g_end;
+      continue;
+    }
+
+    wires.clear();
+    wires.reserve(g_end - g_start);
+    for (std::size_t k = g_start; k < g_end; ++k) {
+      WireGeom wg;
+      wg.pts = valid_conns[k].pts;
+      const auto& pts = *wg.pts;
+      for (std::size_t i = 0; i + 1 < pts.size(); ++i) {
+        const Point& p0 = pts[i];
+        const Point& p1 = pts[i + 1];
+        if (std::abs(p0.y - p1.y) <= kEps && std::abs(p0.x - p1.x) > kEps) {
+          wg.h_segs.push_back({0.5 * (p0.y + p1.y), std::min(p0.x, p1.x),
+                               std::max(p0.x, p1.x), i});
+        } else if (std::abs(p0.x - p1.x) <= kEps &&
+                   std::abs(p0.y - p1.y) > kEps) {
+          wg.v_segs.push_back({0.5 * (p0.x + p1.x), std::min(p0.y, p1.y),
+                               std::max(p0.y, p1.y), i});
+        }
+      }
+      wires.push_back(std::move(wg));
+    }
+
+    const Id src_id = static_cast<Id>(group_key >> 32);
+    const Id sp_id = static_cast<Id>(group_key & 0xffffffffu);
+    const Point src_pin = PinPosition(blocks_.at(src_id).rect,
+                                      FindPin(blocks_.at(src_id), sp_id));
+
+    auto push_joint = [&](Point p) {
+      if (!near_pt(p, src_pin)) {
+        raw_joints.push_back(p);
+      }
+    };
+
+    for (std::size_t i = 0; i < wires.size(); ++i) {
+      for (std::size_t j = i + 1; j < wires.size(); ++j) {
+        const WireGeom& wi = wires[i];
+        const WireGeom& wj = wires[j];
+
+        // 1. T-junctions: interior vertex of one wire strictly inside a
+        //    segment of the other wire.
+        auto check_vertices = [&](const WireGeom& src_w,
+                                  const WireGeom& seg_w) {
+          const auto& pts = *src_w.pts;
+          for (std::size_t k = 1; k + 1 < pts.size(); ++k) {
+            const Point p = pts[k];
+            if (is_terminal(*seg_w.pts, p)) {
+              continue;
+            }
+            bool hit = false;
+            for (const auto& h : seg_w.h_segs) {
+              if (std::abs(p.y - h.y) <= kEps && h.x0 + kEps < p.x &&
+                  p.x < h.x1 - kEps) {
+                hit = true;
+                break;
+              }
+            }
+            if (!hit) {
+              for (const auto& v : seg_w.v_segs) {
+                if (std::abs(p.x - v.x) <= kEps && v.y0 + kEps < p.y &&
+                    p.y < v.y1 - kEps) {
+                  hit = true;
+                  break;
+                }
+              }
+            }
+            if (hit) {
+              push_joint(p);
+            }
+          }
+        };
+        check_vertices(wi, wj);
+        check_vertices(wj, wi);
+
+        // 2. Shared collinear segment divergence endpoints.
+        for (const auto& h1 : wi.h_segs) {
+          for (const auto& h2 : wj.h_segs) {
+            if (std::abs(h1.y - h2.y) > kEps) {
+              continue;
+            }
+            const double ox0 = std::max(h1.x0, h2.x0);
+            const double ox1 = std::min(h1.x1, h2.x1);
+            if (ox1 - ox0 <= kEps) {
+              continue;
+            }
+            const double my = 0.5 * (h1.y + h2.y);
+            const unsigned d1_l = out_dir_horiz(wi, h1, ox0, kLeft);
+            const unsigned d2_l = out_dir_horiz(wj, h2, ox0, kLeft);
+            if (d1_l && d2_l && d1_l != d2_l) {
+              push_joint({ox0, my});
+            }
+            const unsigned d1_r = out_dir_horiz(wi, h1, ox1, kRight);
+            const unsigned d2_r = out_dir_horiz(wj, h2, ox1, kRight);
+            if (d1_r && d2_r && d1_r != d2_r) {
+              push_joint({ox1, my});
+            }
+          }
+        }
+        for (const auto& v1 : wi.v_segs) {
+          for (const auto& v2 : wj.v_segs) {
+            if (std::abs(v1.x - v2.x) > kEps) {
+              continue;
+            }
+            const double oy0 = std::max(v1.y0, v2.y0);
+            const double oy1 = std::min(v1.y1, v2.y1);
+            if (oy1 - oy0 <= kEps) {
+              continue;
+            }
+            const double mx = 0.5 * (v1.x + v2.x);
+            const unsigned d1_u = out_dir_vert(wi, v1, oy0, kUp);
+            const unsigned d2_u = out_dir_vert(wj, v2, oy0, kUp);
+            if (d1_u && d2_u && d1_u != d2_u) {
+              push_joint({mx, oy0});
+            }
+            const unsigned d1_d = out_dir_vert(wi, v1, oy1, kDown);
+            const unsigned d2_d = out_dir_vert(wj, v2, oy1, kDown);
+            if (d1_d && d2_d && d1_d != d2_d) {
+              push_joint({mx, oy1});
+            }
+          }
+        }
+
+        // 3. Same-net orthogonal interior crossings.
+        auto check_crossings = [&](const WireGeom& hw, const WireGeom& vw) {
+          for (const auto& h : hw.h_segs) {
+            for (const auto& v : vw.v_segs) {
+              if (h.x0 + kEps < v.x && v.x < h.x1 - kEps && v.y0 + kEps < h.y &&
+                  h.y < v.y1 - kEps) {
+                const Point cross{v.x, h.y};
+                if (!is_terminal(*hw.pts, cross) &&
+                    !is_terminal(*vw.pts, cross)) {
+                  push_joint(cross);
+                }
+              }
+            }
+          }
+        };
+        check_crossings(wi, wj);
+        check_crossings(wj, wi);
+      }
+    }
+    g_start = g_end;
+  }
+
+  if (raw_joints.empty()) {
+    return {};
+  }
+  std::sort(raw_joints.begin(), raw_joints.end(), [](Point a, Point b) {
+    return a.x != b.x ? a.x < b.x : a.y < b.y;
+  });
+  std::vector<Point> out;
+  out.reserve(raw_joints.size());
+  for (const Point p : raw_joints) {
+    bool dup = false;
+    for (std::size_t k = out.size(); k > 0; --k) {
+      const Point& prev = out[k - 1];
+      if (p.x - prev.x > kEps) {
+        break;
+      }
+      if (std::abs(p.y - prev.y) <= kEps) {
+        dup = true;
+        break;
+      }
+    }
+    if (!dup) {
+      out.push_back(p);
+    }
+  }
+  return out;
 }
 
 void LocalOrthogonalRouter::RouteAllParallel(unsigned threads) {

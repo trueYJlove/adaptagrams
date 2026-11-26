@@ -10,6 +10,7 @@ AsyncLocalRouter::AsyncLocalRouter(LocalOrthogonalRouter initial)
   snapshot.index_ = model_.index_;
   snapshot.blocks_ = model_.blocks_;
   snapshot.conns_ = model_.conns_;
+  snapshot.adjacent_ = model_.adjacent_;
   snapshot.routes_ = model_.routes_;
   worker_ = std::thread(
       [this, s = std::move(snapshot)]() mutable { Run(std::move(s)); });
@@ -111,6 +112,43 @@ void AsyncLocalRouter::Settle() {
   Refresh();
 }
 
+bool AsyncLocalRouter::MoveRouteSegment(Id conn_id, std::size_t seg_index,
+                                        double new_coord) {
+  if (!model_.MoveRouteSegment(conn_id, seg_index, new_coord)) {
+    return false;
+  }
+  Route updated = model_.route(conn_id);
+  std::lock_guard<std::mutex> lock(mutex_);
+  pending_.erase(conn_id);
+  gesture_.erase(conn_id);
+  nudged_.erase(conn_id);
+  dirty_for_nudge_.erase(conn_id);
+  route_overrides_[conn_id] = std::move(updated);
+  Refresh();
+  return true;
+}
+
+std::vector<Id> AsyncLocalRouter::AutoRouteConnectors(
+    const std::vector<Id>& conn_ids) {
+  const std::vector<Id> changed = model_.AutoRouteConnectors(conn_ids);
+  if (changed.empty()) {
+    return {};
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (Id cid : changed) {
+    pending_.erase(cid);
+    gesture_.erase(cid);
+    nudged_.erase(cid);
+    dirty_for_nudge_.erase(cid);
+    const auto rit = model_.routes_.find(cid);
+    if (rit != model_.routes_.end()) {
+      route_overrides_[cid] = rit->second;
+    }
+  }
+  Refresh();
+  return changed;
+}
+
 void AsyncLocalRouter::set_reroute_third_party_blocked(bool enabled) {
   model_.set_reroute_third_party_blocked(enabled);
   std::lock_guard<std::mutex> lock(mutex_);
@@ -182,6 +220,7 @@ void AsyncLocalRouter::Run(LocalOrthogonalRouter snapshot) {
     for (;;) {
       std::vector<std::pair<Id, bool>> ids;
       std::unordered_map<Id, Rect> changes;
+      std::unordered_map<Id, Route> route_changes;
       {
         std::unique_lock<std::mutex> lock(mutex_);
         wake_.wait(lock, [&] { return stopped_ || version != generation_; });
@@ -190,6 +229,7 @@ void AsyncLocalRouter::Run(LocalOrthogonalRouter snapshot) {
         }
         version = generation_;
         changes.swap(edits_);
+        route_changes.swap(route_overrides_);
         if (has_config_update_) {
           snapshot.cfg_.reroute_third_party_blocked =
               pending_reroute_third_party_;
@@ -216,6 +256,9 @@ void AsyncLocalRouter::Run(LocalOrthogonalRouter snapshot) {
       for (const auto& entry : changes) {
         snapshot.index_.Update(entry.first, entry.second);
         snapshot.blocks_.at(entry.first).rect = entry.second;
+      }
+      for (auto& entry : route_changes) {
+        snapshot.Publish(entry.first, std::move(entry.second));
       }
       for (const auto& item : ids) {
         {

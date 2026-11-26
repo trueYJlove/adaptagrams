@@ -616,6 +616,231 @@ void TestNarrowGapAvoidance() {
   }
 }
 
+void TestSolderJointDetection() {
+  Config cfg;
+  cfg.enable_channel_nudging = true;
+  LocalOrthogonalRouter r(cfg);
+
+  // Block 1 (right pin at (80, 70)) fans out to Blocks 2, 3, and 4.
+  r.AddBlock({1, {0.0, 40.0, 80.0, 100.0}, {{1, 1.0, 0.5, kRight}}});
+  r.AddBlock({2, {280.0, -40.0, 360.0, 20.0}, {{2, 0.0, 0.5, kLeft}}});
+  r.AddBlock({3, {280.0, 40.0, 360.0, 100.0}, {{2, 0.0, 0.5, kLeft}}});
+  r.AddBlock({4, {280.0, 120.0, 360.0, 180.0}, {{2, 0.0, 0.5, kLeft}}});
+
+  // Unrelated crossing net: Block 5 -> Block 6 vertical at x = 120 crosses y
+  // = 70.
+  r.AddBlock({5, {95.0, -100.0, 145.0, -50.0}, {{3, 0.5, 1.0, kDown}}});
+  r.AddBlock({6, {95.0, 200.0, 145.0, 250.0}, {{4, 0.5, 0.0, kUp}}});
+
+  r.AddConnector({1, 1, 1, 2, 2});
+  r.AddConnector({2, 1, 1, 3, 2});
+  r.AddConnector({3, 1, 1, 4, 2});
+  r.AddConnector({4, 5, 3, 6, 4});
+
+  r.RouteAllParallel(1);
+  for (Id cid : {1u, 2u, 3u, 4u}) {
+    CHECK(r.route(cid).status == Status::kValid);
+  }
+
+  // All 3 fan-out branches plus crossing net -> exactly 1 solder joint at
+  // (180, 70); the different-net orthogonal crossing at (120, 70) must NOT
+  // produce a solder joint.
+  const std::vector<Point> joints_all = r.ComputeSolderJoints({1, 2, 3, 4});
+  CHECK(joints_all.size() == 1);
+  CHECK(std::abs(joints_all[0].x - 180.0) <= 1e-3);
+  CHECK(std::abs(joints_all[0].y - 70.0) <= 1e-3);
+
+  // Even without the straight middle wire, shared trunk divergence of 1 & 3
+  // still detects the solder joint at (180, 70).
+  const std::vector<Point> joints_split = r.ComputeSolderJoints({1, 3});
+  CHECK(joints_split.size() == 1);
+  CHECK(std::abs(joints_split[0].x - 180.0) <= 1e-3);
+  CHECK(std::abs(joints_split[0].y - 70.0) <= 1e-3);
+
+  // Different-net crossing alone produces zero solder joints.
+  CHECK(r.ComputeSolderJoints({2, 4}).empty());
+}
+
+void TestManualSegmentDragAndPreserve() {
+  Config cfg;
+  cfg.nudge_distance = 6.0;
+  cfg.enable_channel_nudging = true;
+  LocalOrthogonalRouter r(cfg);
+
+  // Conn 1: Z-route from (80, 30) to (280, 110), default vertical mid at x=180.
+  r.AddBlock({1, {0.0, 0.0, 80.0, 60.0}, {{1, 1.0, 0.5, kRight}}});
+  r.AddBlock({2, {280.0, 80.0, 360.0, 140.0}, {{2, 0.0, 0.5, kLeft}}});
+  r.AddConnector({1, 1, 1, 2, 2});
+
+  // Conn 2: 2-point horizontal wire (80, 230) -> (280, 230).
+  r.AddBlock({3, {0.0, 200.0, 80.0, 260.0}, {{1, 1.0, 0.5, kRight}}});
+  r.AddBlock({4, {280.0, 200.0, 360.0, 260.0}, {{2, 0.0, 0.5, kLeft}}});
+  r.AddConnector({2, 3, 1, 4, 2});
+
+  // Conn 3: independent wire whose midpoint can overlap x = 210 to test
+  // nudging.
+  r.AddBlock({5, {40.0, 70.0, 120.0, 110.0}, {{1, 1.0, 0.5, kRight}}});
+  r.AddBlock({6, {280.0, 0.0, 360.0, 40.0}, {{2, 0.0, 0.5, kLeft}}});
+  r.AddConnector({3, 5, 1, 6, 2});
+
+  r.RouteAllParallel(1);
+  CHECK(r.route(1).status == Status::kValid && !r.route(1).user_modified);
+  CHECK(r.route(2).status == Status::kValid && r.route(2).points.size() == 2);
+
+  // Drag conn 1's middle vertical segment (seg 1) to x = 210.
+  CHECK(r.MoveRouteSegment(1, 1, 210.0));
+  CHECK(r.route(1).status == Status::kValid);
+  CHECK(r.route(1).user_modified);
+  CHECK(r.route(1).method == RouteMethod::kReuse);
+  CHECK(std::abs(r.route(1).points[1].x - 210.0) <= 1e-6);
+  CHECK(std::abs(r.route(1).points[2].x - 210.0) <= 1e-6);
+
+  // Move Block 1 slightly (even on release settled=true): hand-adjusted middle
+  // segment at x = 210 must be preserved ahead of Simple L/Z.
+  r.MoveBlock(1, 0.0, 10.0);
+  r.RerouteAffected({1}, true);
+  CHECK(r.route(1).status == Status::kValid);
+  CHECK(r.route(1).user_modified);
+  CHECK(std::abs(r.route(1).points[1].x - 210.0) <= 1e-6);
+  CHECK(std::abs(r.route(1).points[2].x - 210.0) <= 1e-6);
+
+  // Move Block 5 so conn 3's midpoint lands at x = 210: ChannelNudger must
+  // treat conn 1 as a fixed anchor and move conn 3 away, leaving conn 1 at x =
+  // 210.
+  r.MoveBlock(5, 20.0, 0.0);  // B5 right becomes 140, mid(140, 280) = 210.
+  r.RerouteAffected({5}, false);
+  CHECK(std::abs(r.route(1).points[1].x - 210.0) <= 1e-6);
+  CHECK(r.route(3).status == Status::kValid);
+  CHECK(std::abs(r.route(3).points[1].x - 210.0) >= 4.0);
+
+  // Drag 2-point direct conn 2 vertically to y = 175: inserts orthogonal Z/U.
+  CHECK(r.MoveRouteSegment(2, 0, 175.0));
+  CHECK(r.route(2).status == Status::kValid);
+  CHECK(r.route(2).user_modified);
+  CHECK(r.route(2).points.size() >= 4);
+  bool has_horiz_175 = false;
+  for (std::size_t j = 1; j < r.route(2).points.size(); ++j) {
+    if (std::abs(r.route(2).points[j - 1].y - 175.0) <= 1e-6 &&
+        std::abs(r.route(2).points[j].y - 175.0) <= 1e-6) {
+      has_horiz_175 = true;
+    }
+  }
+  CHECK(has_horiz_175);
+
+  // Auto-route conn 2 clears user_modified and restores straight 2-point line.
+  r.AutoRouteConnectors({2});
+  CHECK(!r.route(2).user_modified);
+  CHECK(r.route(2).status == Status::kValid);
+  CHECK(r.route(2).points.size() == 2);
+
+  // If an obstacle blocks the locked segment x = 210 and Block 1 moves,
+  // fallback to normal routing clears user_modified and avoids the obstacle.
+  r.AddBlock({9, {195.0, 20.0, 225.0, 130.0}, {}});
+  r.MoveBlock(1, 0.0, -5.0);
+  r.RerouteAffected({1}, false);
+  CHECK(r.route(1).status == Status::kValid);
+  CHECK(!r.route(1).user_modified);
+}
+
+void TestAutoRouteSelectedLines() {
+  Config cfg;
+  cfg.nudge_distance = 6.0;
+  cfg.enable_channel_nudging = true;
+  LocalOrthogonalRouter r(cfg);
+
+  r.AddBlock({1, {0.0, 0.0, 80.0, 50.0}, {{1, 1.0, 0.5, kRight}}});
+  r.AddBlock({2, {280.0, 80.0, 360.0, 130.0}, {{2, 0.0, 0.5, kLeft}}});
+  r.AddBlock({3, {0.0, 70.0, 80.0, 120.0}, {{1, 1.0, 0.5, kRight}}});
+  r.AddBlock({4, {280.0, 140.0, 360.0, 190.0}, {{2, 0.0, 0.5, kLeft}}});
+  // Obstacle in the middle corridor (x in [150, 210], y in [-10, 200]).
+  const Rect obs{150.0, -10.0, 210.0, 200.0};
+  r.AddBlock({5, obs, {}});
+
+  r.AddConnector({1, 1, 1, 2, 2});
+  r.AddConnector({2, 3, 1, 4, 2});
+  r.RouteAllParallel(1);
+
+  // Force both wires through the obstacle via manual segment drag ->
+  // DisplayOnly.
+  CHECK(r.MoveRouteSegment(1, 1, 180.0));
+  CHECK(r.MoveRouteSegment(2, 1, 180.0));
+  CHECK(r.route(1).user_modified && r.route(1).status == Status::kDisplayOnly);
+  CHECK(r.route(2).user_modified && r.route(2).status == Status::kDisplayOnly);
+
+  // Auto-route selected wires via AsyncLocalRouter to also verify async parity.
+  AsyncLocalRouter async_router(std::move(r));
+  const std::vector<Id> updated = async_router.AutoRouteConnectors({1, 2});
+  CHECK(updated.size() >= 2);
+  for (Id cid : {1u, 2u}) {
+    const Route& rt = async_router.view().route(cid);
+    CHECK(!rt.user_modified);
+    CHECK(rt.status == Status::kValid);
+    for (std::size_t j = 1; j < rt.points.size(); ++j) {
+      const Rect seg = Box(rt.points[j - 1], rt.points[j]);
+      CHECK(
+          !(seg.r > obs.l && seg.l < obs.r && seg.b > obs.t && seg.t < obs.b));
+    }
+  }
+}
+
+void TestWireCongestionSoftPenalty() {
+  Config cfg;
+  cfg.buffer = 5.0;
+  cfg.penalty = 50.0;
+  cfg.wire_overlap_penalty = 25.0;
+  auto solver = LazyHananAStarSolver();
+
+  // Symmetric dual narrow-slit corridor layout:
+  // src pin at (60, 120), dst pin at (300, 120); center obstacle blocks y=120.
+  // Upper narrow slit: b_upper.b + buf = 105, b_center.t - buf = 105 -> track
+  // at y = 105 (detour |105 - 120| = 15, total +30).
+  // Lower narrow slit: b_center.b + buf = 138, b_lower.t - buf = 138 -> track
+  // at y = 138 (detour |138 - 120| = 18, total +36).
+  const Block b_src{1, {0.0, 90.0, 60.0, 150.0}, {{1, 1.0, 0.5, kRight}}};
+  const Block b_dst{2, {300.0, 90.0, 360.0, 150.0}, {{2, 0.0, 0.5, kLeft}}};
+  const Block b_upper{10, {110.0, 40.0, 230.0, 100.0}, {}};
+  const Block b_center{11, {110.0, 110.0, 230.0, 133.0}, {}};
+  const Block b_lower{12, {110.0, 143.0, 230.0, 200.0}, {}};
+  const std::vector<const Block*> obs{&b_src, &b_dst, &b_upper, &b_center,
+                                      &b_lower};
+  const Conn conn{1, 1, 1, 2, 2};
+
+  auto mean_mid_y = [](const std::vector<Point>& pts) {
+    for (std::size_t j = 1; j < pts.size(); ++j) {
+      if (std::abs(pts[j - 1].y - pts[j].y) <= 1e-6 &&
+          std::min(pts[j - 1].x, pts[j].x) <= 120.0 &&
+          std::max(pts[j - 1].x, pts[j].x) >= 220.0) {
+        return pts[j].y;
+      }
+    }
+    return 120.0;
+  };
+
+  // 1. Baseline (no occupied wires): picks slightly shorter upper corridor.
+  const std::vector<Point> base_pts =
+      solver->Solve({cfg, conn, obs, false, nullptr, nullptr});
+  CHECK(base_pts.size() >= 4);
+  CHECK(mean_mid_y(base_pts) < 110.0);
+
+  // 2. Different-source wire occupies upper corridor (y = 105): penalty (25) >
+  //    extra detour (6), so solver switches to free lower corridor (y > 135).
+  const std::vector<OccupiedSegment> other_net_occ{
+      {{90.0, 105.0}, {250.0, 105.0}, 99, 1}};
+  const std::vector<Point> detour_pts =
+      solver->Solve({cfg, conn, obs, false, nullptr, &other_net_occ});
+  CHECK(detour_pts.size() >= 4);
+  CHECK(mean_mid_y(detour_pts) > 135.0);
+
+  // 3. Same-source fan-out wire (NetKey {1, 1}) occupies upper corridor: NO
+  //    penalty is charged, so solver continues sharing the upper corridor.
+  const std::vector<OccupiedSegment> same_net_occ{
+      {{90.0, 105.0}, {250.0, 105.0}, 1, 1}};
+  const std::vector<Point> shared_pts =
+      solver->Solve({cfg, conn, obs, false, nullptr, &same_net_occ});
+  CHECK(shared_pts.size() >= 4);
+  CHECK(mean_mid_y(shared_pts) < 110.0);
+}
+
 }  // namespace
 }  // namespace localroute
 
@@ -635,6 +860,11 @@ int main(int argc, char** argv) {
       {"ChannelNudgingCascadeAndNoHook",
        localroute::TestChannelNudgingCascadeAndNoHook},
       {"NarrowGapObstacleAvoidance", localroute::TestNarrowGapAvoidance},
+      {"SolderJointDetection", localroute::TestSolderJointDetection},
+      {"ManualSegmentDragAndPreserve",
+       localroute::TestManualSegmentDragAndPreserve},
+      {"AutoRouteSelectedLines", localroute::TestAutoRouteSelectedLines},
+      {"WireCongestionSoftPenalty", localroute::TestWireCongestionSoftPenalty},
   };
   try {
     for (const auto& t : kCases) {

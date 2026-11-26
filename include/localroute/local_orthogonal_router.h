@@ -1,6 +1,7 @@
 #ifndef LOCALROUTE_INCLUDE_LOCALROUTE_LOCAL_ORTHOGONAL_ROUTER_H_
 #define LOCALROUTE_INCLUDE_LOCALROUTE_LOCAL_ORTHOGONAL_ROUTER_H_
 
+#include <cstddef>
 #include <memory>
 #include <set>
 #include <string>
@@ -30,6 +31,9 @@ class LocalOrthogonalRouter {
   void RouteAllParallel(unsigned threads = 0);
   void RouteConnector(Id id);
   void MarkConnector(Id id);
+  bool MoveRouteSegment(Id conn_id, std::size_t seg_index, double new_coord);
+  std::vector<Id> AutoRouteConnectors(const std::vector<Id>& conn_ids);
+  std::vector<Point> ComputeSolderJoints(const std::vector<Id>& conn_ids) const;
   LocalOrthogonalRouter Clone() const { return *this; }
   std::vector<Point> Preview(Id id) const;
   void set_reroute_third_party_blocked(bool enabled);
@@ -53,7 +57,8 @@ class LocalOrthogonalRouter {
                          const std::vector<Id>& highlight = {}) const;
 
  private:
-  Route SolveOne(const Conn& conn, bool settled) const;
+  Route SolveOne(const Conn& conn, bool settled, bool force_auto_route = false,
+                 bool allow_congestion = false) const;
   void Mark(Id id);
   void InvalidateObstacle(Id block_id, Rect rect);
   void ClearSegments(Id id);

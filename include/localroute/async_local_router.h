@@ -32,6 +32,8 @@ class AsyncLocalRouter {
   void Move(const std::vector<std::pair<Id, Rect>>& moves);
   void Prioritize(Rect viewport, const std::vector<Id>& selection = {});
   void Settle();
+  bool MoveRouteSegment(Id conn_id, std::size_t seg_index, double new_coord);
+  std::vector<Id> AutoRouteConnectors(const std::vector<Id>& conn_ids);
   void set_reroute_third_party_blocked(bool enabled);
   void set_enable_channel_nudging(bool enabled);
   std::size_t Poll(std::size_t max_results = 64,
@@ -51,6 +53,7 @@ class AsyncLocalRouter {
   std::set<Id> priority_;
   std::set<Id> nudged_;
   std::unordered_map<Id, Rect> edits_;
+  std::unordered_map<Id, Route> route_overrides_;
   std::deque<std::pair<Id, Route>> ready_;
   std::size_t generation_ = 0;
   std::size_t ready_generation_ = 0;

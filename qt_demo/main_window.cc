@@ -57,13 +57,19 @@ MainWindow::MainWindow(unsigned initial_scale, QWidget* parent)
   highlight_fallback_check_->setChecked(false);
   toolbar->addWidget(highlight_fallback_check_);
 
+  hops_check_ = new QCheckBox("交叉跳线弧 (Hops)", toolbar);
+  hops_check_->setChecked(true);
+  toolbar->addWidget(hops_check_);
+
   toolbar->addSeparator();
   auto* fit_btn = new QPushButton("适应全图 (F)", toolbar);
   auto* reset_btn = new QPushButton("局部 100% 视角 (R)", toolbar);
   auto* route_all_btn = new QPushButton("重新全图布线", toolbar);
+  auto_route_btn_ = new QPushButton("整理选中线 (Auto-route)", toolbar);
   toolbar->addWidget(fit_btn);
   toolbar->addWidget(reset_btn);
   toolbar->addWidget(route_all_btn);
+  toolbar->addWidget(auto_route_btn_);
 
   BuildDocks();
 
@@ -78,11 +84,15 @@ MainWindow::MainWindow(unsigned initial_scale, QWidget* parent)
           &MainWindow::OnChannelNudgingToggled);
   connect(highlight_fallback_check_, &QCheckBox::toggled, this,
           &MainWindow::OnHighlightFallbackToggled);
+  connect(hops_check_, &QCheckBox::toggled, this,
+          &MainWindow::OnLineHopsToggled);
   connect(fit_btn, &QPushButton::clicked, canvas_, &CanvasWidget::FitAll);
   connect(reset_btn, &QPushButton::clicked, canvas_,
           &CanvasWidget::ResetLocalView);
   connect(route_all_btn, &QPushButton::clicked, canvas_,
           &CanvasWidget::RouteAll);
+  connect(auto_route_btn_, &QPushButton::clicked, this,
+          &MainWindow::OnAutoRouteClicked);
   connect(canvas_, &CanvasWidget::StatusChanged, this,
           &MainWindow::UpdateStatusSummary);
   connect(canvas_, &CanvasWidget::SelectionChanged, this,
@@ -147,9 +157,9 @@ void MainWindow::BuildDocks() {
       "操作提示:\n"
       "• 从左侧图元库拖拽模块到画布（或双击）\n"
       "• 鼠标悬停任意端口圆点（变绿）按住拖到另一端口完成连线\n"
-      "• 选中模块后可在此修改各方向端口数量\n"
-      "• 右键模块/连线可快速增删端口或删除\n"
-      "• 点“清空画布”可从空白开始搭避障测试场景",
+      "• 悬停连线可拖拽中段并锁定，点“整理选中线”恢复自动避障分轨\n"
+      "• 拖动单模块靠近端口对齐时自动直线吸附（按住 Alt 取消吸附）\n"
+      "• 选中模块后可在此修改各方向端口数量，右键可快速编辑",
       panel);
   tips->setWordWrap(true);
   tips->setStyleSheet("color: #4a5568; font-size: 12px; padding-top: 8px;");
@@ -213,6 +223,12 @@ void MainWindow::OnHighlightFallbackToggled(bool checked) {
   canvas_->SetHighlightFallback(checked);
 }
 
+void MainWindow::OnLineHopsToggled(bool checked) {
+  canvas_->SetShowLineHops(checked);
+}
+
+void MainWindow::OnAutoRouteClicked() { (void)canvas_->AutoRouteSelection(); }
+
 void MainWindow::OnPortSpinChanged() {
   if (updating_inspector_) {
     return;
@@ -236,6 +252,8 @@ void MainWindow::SyncInspectorFromSelection() {
   make_obs_btn_->setEnabled(single);
   clear_wires_btn_->setEnabled(single);
   delete_sel_btn_->setEnabled(canvas_->selected_block_count() > 0 ||
+                              canvas_->has_selected_conn());
+  auto_route_btn_->setEnabled(canvas_->selected_block_count() > 0 ||
                               canvas_->has_selected_conn());
 
   if (single) {

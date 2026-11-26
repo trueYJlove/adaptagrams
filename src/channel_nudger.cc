@@ -155,7 +155,9 @@ std::vector<Id> CollectParticipants(
       if (rit != routes.end() && rit->second.status == Status::kValid &&
           rit->second.points.size() >= 4) {
         selected.insert(kv.first);
-        mutable_set_out->insert(kv.first);
+        if (!rit->second.user_modified) {
+          mutable_set_out->insert(kv.first);
+        }
       }
     }
     return {selected.begin(), selected.end()};
@@ -170,7 +172,9 @@ std::vector<Id> CollectParticipants(
       continue;
     }
     selected.insert(cid);
-    mutable_set_out->insert(cid);
+    if (!rit->second.user_modified) {
+      mutable_set_out->insert(cid);
+    }
     const Rect rb = RouteBounds(rit->second.points);
     if (!has_box) {
       union_box = rb;
@@ -451,13 +455,11 @@ void NudgeAxis(
   }
 
   std::vector<TrackAnchor> base_fixed_anchors;
-  if (!full_graph) {
-    for (const MiddleSegment& s : all_segs) {
-      if (!s.is_mutable) {
-        base_fixed_anchors.push_back({s.net, s.coord, s.min_k, s.max_k,
-                                      s.prev_prim, s.next_prim, s.k_at_seg,
-                                      s.k_at_next});
-      }
+  for (const MiddleSegment& s : all_segs) {
+    if (!s.is_mutable) {
+      base_fixed_anchors.push_back({s.net, s.coord, s.min_k, s.max_k,
+                                    s.prev_prim, s.next_prim, s.k_at_seg,
+                                    s.k_at_next});
     }
   }
 
