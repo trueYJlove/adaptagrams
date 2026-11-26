@@ -226,6 +226,25 @@ void TestOverlap() {
     CHECK(rt.points[2].y == rt.points[3].y);
     CHECK(rt.points[2].y < u_top || rt.points[2].y > u_bot);
   }
+
+  // Non-overlapping far blocks with a buried pin must NOT trigger a full-span
+  // outer loop; must remain a compact L/Z inside Box(a, b).
+  {
+    LocalOrthogonalRouter sep;
+    sep.AddBlock(MakeBlock(1, {0.0, 0.0, 80.0, 50.0}));
+    sep.AddBlock(MakeBlock(2, {400.0, 120.0, 480.0, 170.0}));
+    sep.AddBlock(MakeBlock(3, {70.0, 0.0, 110.0, 50.0}));  // Buries pin (80,25)
+    sep.AddConnector({1, 1, 1, 2, 2});
+    sep.RouteAllParallel(1);
+    const Route& rt = sep.route(1);
+    CHECK(rt.status == Status::kDisplayOnly);
+    CHECK(rt.outcome == Outcome::kBuriedPin);
+    CHECK(rt.points.size() <= 4);
+    for (const Point p : rt.points) {
+      CHECK(p.x >= 80.0 && p.x <= 400.0);
+      CHECK(p.y >= 25.0 && p.y <= 145.0);
+    }
+  }
 }
 
 void TestParallel() {
@@ -561,6 +580,42 @@ void TestChannelNudgingCascadeAndNoHook() {
   }
 }
 
+void TestNarrowGapAvoidance() {
+  Config cfg;
+  cfg.buffer = 8.0;
+  cfg.fast_paths = false;
+  LocalOrthogonalRouter r(cfg);
+
+  // B9 and B8 leave only a 5px narrow gap (< buffer = 8px) right next to B9's
+  // output pin, while B3 blocks the upper-right corridor; B9 -> B10 must shrink
+  // the nearby buffer dynamically, escape cleanly without body intersection or
+  // full-screen outer loop, and route Status::kValid around B8 and B3.
+  const Rect b9_rect{0.0, 0.0, 90.0, 40.0};
+  const Rect b8_rect{95.0, 0.0, 175.0, 90.0};  // 5px horizontal gap from B9
+  const Rect b3_rect{0.0, 45.0, 90.0, 95.0};   // 5px vertical gap below B9
+  const Rect b10_rect{240.0, 20.0, 320.0, 80.0};
+
+  r.AddBlock({9, b9_rect, {{1, 1.0, 0.5, kRight}}});
+  r.AddBlock({8, b8_rect, {}});
+  r.AddBlock({3, b3_rect, {}});
+  r.AddBlock({10, b10_rect, {{1, 0.0, 0.5, kLeft}}});
+  r.AddConnector({1, 9, 1, 10, 1});
+
+  r.RouteAllParallel(1);
+  const Route& rt = r.route(1);
+  CHECK(rt.status == Status::kValid);
+  CHECK(rt.points.size() >= 4);
+  CHECK(rt.points[1].x > rt.points[0].x && rt.points[1].x < b8_rect.l);
+  for (std::size_t j = 1; j < rt.points.size(); ++j) {
+    const Rect seg = Box(rt.points[j - 1], rt.points[j]);
+    CHECK(seg.l == seg.r || seg.t == seg.b);
+    CHECK(!(seg.r > b8_rect.l && seg.l < b8_rect.r && seg.b > b8_rect.t &&
+            seg.t < b8_rect.b));
+    CHECK(!(seg.r > b3_rect.l && seg.l < b3_rect.r && seg.b > b3_rect.t &&
+            seg.t < b3_rect.b));
+  }
+}
+
 }  // namespace
 }  // namespace localroute
 
@@ -579,6 +634,7 @@ int main(int argc, char** argv) {
        localroute::TestChannelNudgingParallelBundle},
       {"ChannelNudgingCascadeAndNoHook",
        localroute::TestChannelNudgingCascadeAndNoHook},
+      {"NarrowGapObstacleAvoidance", localroute::TestNarrowGapAvoidance},
   };
   try {
     for (const auto& t : kCases) {

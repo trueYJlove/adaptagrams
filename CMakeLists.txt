@@ -38,6 +38,7 @@ if(LOCALROUTE_BUILD_TESTS)
         LazyHananAStarBoundaryCases
         ChannelNudgingParallelBundle
         ChannelNudgingCascadeAndNoHook
+        NarrowGapObstacleAvoidance
     )
         add_test(NAME local.${t} COMMAND test_unit ${t})
     endforeach()

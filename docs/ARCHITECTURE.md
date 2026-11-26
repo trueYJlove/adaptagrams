@@ -21,6 +21,7 @@ include/localroute/
 └── async_local_router.h       # 异步后台工作线程会话、视口优先调度与过期结果丢弃
 
 src/
+├── geometry_utils.h             # 内部共享窄缝缓冲距离计算工具（RectPointGap / EffectiveObstacleBuffer）
 ├── lazy_hanan_a_star_solver.cc  # 默认求解器：非均匀正交网格 + 二维阻塞位图 + 两阶段正交 A*
 ├── local_orthogonal_router.cc   # 同步路由器实现、退化前置检查与 SVG 调试导出
 ├── channel_nudger.h / .cc       # 轻量局部通道分轨（按 NetKey 等距无交叉分轨）
@@ -46,9 +47,10 @@ qt_demo/
 
 对每一条待求连线，按成本由低到高依次经过 4 个阶段，任一阶段产出均需通过统一的 `accept()` 全局碰撞与方向复验：
 
-1. **前置退化检测**：
-   * 起止引脚重合 → 标记 `Outcome::kCoincidentPins`、`Status::kDisplayOnly`；
-   * 起点或终点引脚落在第三方模块膨胀缓冲框内部 → 标记 `Outcome::kBuriedPin`、`Status::kDisplayOnly`。
+1. **前置退化检测与窄缝自适应放行**：
+   * 起止引脚重合 → 标记 `Outcome::kCoincidentPins`、`Status::kFailed`；
+   * 仅当起点或终点引脚埋入**第三方模块本体矩形 `rect.Inside(end)`** 内部时标记 `Outcome::kBuriedPin`、`Status::kDisplayOnly`；
+   * 若引脚位于第三方模块 `buffer` 膨胀缝隙中（`gap < cfg.buffer` 且未进入本体矩形），不直接弃算，而是将该邻近障碍与对应起止端点的有效缓冲动态收缩至 `std::max(0.0, gap * 0.5 - 0.5)`（`LazyHananAStarSolver` 与 `accept()`/`ValidateAndSimplifyRoute()` 共享同一公式），允许从窄缝正常出线并执行完整 A* 避障。
 2. **轻量快路径（`Config::fast_paths = true` 且非松手微调时启用）**：
    * **第一优先级 — 整线平移复用（`RouteMethod::kReuse`）**：当起止端点位移量 `(dx, dy)` 完全相等（典型为框选批量拖动内部连线）时，整条旧折线平移后直接复验，命中即微秒级返回。
    * **第二优先级 — L / Z 轻量候选（`RouteMethod::kSimple`）**：优先尝试 2 段 L 型折线及中点/缓冲边界对齐的 3 段 Z 型折线并复验；只要拖动后存在无障碍的简洁 2/3 段通路，折线会立即自动收直，彻底消除旧中段残留导致的 4 拐回折尾巴。
@@ -58,16 +60,17 @@ qt_demo/
    * 若窗口内障碍数超过 `budget`（默认 `120`），优先保留 `required` 集合（起止模块 + 前序轮次实际碰撞到的第三方模块），其余按到起止线段垂直距离用 `std::nth_element` 截断保留最近的障碍物。
    * 求解器返回候选折线后，`accept()` 逐段回查**完整全局 `SpatialGridIndex`**；若发生碰撞，将命中的实际障碍物写入 `required` 并进入下一轮重试。
 4. **Simulink 风格兜底降级（`MakeSimulinkFallback`）**：
-   * 若出现引脚埋入（`Outcome::kBuriedPin`）、重试耗尽或超出障碍预算（`Outcome::kObstacleBudget` / `Outcome::kCollision`），保留 `Status::kDisplayOnly` 语义（绝不伪装为 `Status::kValid`），并按端口方向确定性生成 Simulink 风格几何兜底折线：
+   * 若出现引脚埋入（`Outcome::kBuriedPin`）、重试耗尽或超出障碍预算（`Outcome::kObstacleBudget` / `Outcome::kCollision`），保留 `Status::kDisplayOnly` 语义（绝不伪装为 `Status::kValid`），并按模块是否重叠严格分支：
      * **贴边顺向对齐**：`a == b` 或起止方向相对且顺向对齐（如 `Right -> Left` 且 `a.y == b.y && b.x >= a.x`）时直接返回 2 点短连线 `{a, b}`，无多余绕线；
-     * **模块重叠 / 反向越界外环**：基于起止模块联合外包围盒 `U = union(src.rect, dst.rect)` 外扩 `margin = max(buffer * 2.5, 20.0)`，从 `sp.dirs` 沿外侧延伸、从 `dp.dirs` 逆向绕外侧进线，比较上下/左右外侧横梁到起止中心线的距离并择近（等距优先上方/左侧），生成严格满足 `sp.dirs` 与 `dp.dirs` 的干净 6 点 5 段外环（正交或同向组合对称简化）。
+     * **非重叠场景严格收紧（`!src.rect.Pad(cfg.buffer).Intersects(dst.rect.Pad(cfg.buffer))`）**：回退为紧凑的 2/3 段正交 L/Z 折线（`CompactFallback`），绝不因第三方遮挡或超预算生成跨大范围画布的外环；
+     * **起止模块重叠 / 紧贴越界外环（`src.rect.Pad(cfg.buffer).Intersects(dst.rect.Pad(cfg.buffer))`）**：基于起止模块联合外包围盒 `U = union(src.rect, dst.rect)` 外扩 `margin = max(buffer * 2.5, 20.0)`，从 `sp.dirs` 沿外侧延伸、从 `dp.dirs` 逆向绕外侧进线，比较上下/左右外侧横梁到起止中心线的距离并择近（等距优先上方/左侧），生成严格满足 `sp.dirs` 与 `dp.dirs` 的干净 6 点 5 段外环（正交或同向组合对称简化）。
 
 ### 3.3 默认求解器：`LazyHananAStarSolver`
 
 `LazyHananAStarSolver()` 返回的实现摒弃了传统全局可见性图指针链表，采用纯连续数组与线程局部工作区复用，核心流程如下：
 
 1. **非均匀正交坐标离散化**：
-   * 收集起止引脚精确坐标、所有局部障碍物膨胀框 `rect.Pad(buffer)` 的四条边界及外围逃逸环，排序去重并保护引脚坐标不漂移。
+   * 收集起止引脚精确坐标、所有局部障碍物按动态有效缓冲膨胀后的边界 `rect.Pad(eff_buf)` 及外围逃逸环，排序去重并保护引脚坐标不漂移。
    * 当坐标数 `< 200` 时，按空隙宽度优先向大通道注入中点（上限 `240`），使路径自然走通道中央而非紧贴模块边缘。
 2. **微秒级二维阻塞位图（`edge_h` / `edge_v`）**：
    * 针对每个障碍物膨胀框，用二分定位其覆盖的网格区间并标记位掩码（`kBlkOther`、`kBlkSrc`、`kBlkDst`、`kEdgeBorder`）。

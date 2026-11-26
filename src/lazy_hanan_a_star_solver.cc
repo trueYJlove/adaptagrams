@@ -6,6 +6,7 @@
 #include <utility>
 #include <vector>
 
+#include "geometry_utils.h"
 #include "localroute/local_route_solver.h"
 
 namespace localroute {
@@ -265,8 +266,38 @@ class LazyHananAStarSolverImpl final : public LocalRouteSolver {
       return {};
     }
 
-    const Rect aa = src->rect.Pad(q.cfg.buffer);
-    const Rect bb = dst->rect.Pad(q.cfg.buffer);
+    double src_buf = q.cfg.buffer;
+    double dst_buf = q.cfg.buffer;
+    for (const Block* b_obs : q.obstacles) {
+      if (b_obs->id == q.conn.src || b_obs->id == q.conn.dst) {
+        continue;
+      }
+      if (!b_obs->rect.Inside(a)) {
+        const double ga = RectPointGap(b_obs->rect, a);
+        if (ga < q.cfg.buffer) {
+          src_buf = std::min(src_buf, std::max(0.0, ga * 0.5 - 0.5));
+        }
+      }
+      if (!b_obs->rect.Inside(b)) {
+        const double gb = RectPointGap(b_obs->rect, b);
+        if (gb < q.cfg.buffer) {
+          dst_buf = std::min(dst_buf, std::max(0.0, gb * 0.5 - 0.5));
+        }
+      }
+    }
+    const Rect aa = src->rect.Pad(src_buf);
+    const Rect bb = dst->rect.Pad(dst_buf);
+
+    auto obs_rect = [&](const Block* b_obs) {
+      if (b_obs->id == q.conn.src) {
+        return aa;
+      }
+      if (b_obs->id == q.conn.dst) {
+        return bb;
+      }
+      return b_obs->rect.Pad(
+          EffectiveObstacleBuffer(b_obs->rect, a, b, q.cfg.buffer));
+    };
 
     if (a.x == b.x || a.y == b.y) {
       const unsigned d = OrthoDir(a, b);
@@ -282,7 +313,7 @@ class LazyHananAStarSolverImpl final : public LocalRouteSolver {
             if (b_obs->id == q.conn.src || b_obs->id == q.conn.dst) {
               continue;
             }
-            if (Crosses(a, b, b_obs->rect.Pad(q.cfg.buffer))) {
+            if (Crosses(a, b, obs_rect(b_obs))) {
               ok = false;
               break;
             }
@@ -317,7 +348,7 @@ class LazyHananAStarSolverImpl final : public LocalRouteSolver {
     double min_y = std::min(a.y, b.y);
     double max_y = std::max(a.y, b.y);
     for (const Block* b_obs : q.obstacles) {
-      const Rect r = b_obs->rect.Pad(q.cfg.buffer);
+      const Rect r = obs_rect(b_obs);
       xs.push_back(r.l);
       xs.push_back(r.r);
       ys.push_back(r.t);
@@ -371,7 +402,7 @@ class LazyHananAStarSolverImpl final : public LocalRouteSolver {
         bit |= kBlkOther;
       }
 
-      const Rect r = b_obs->rect.Pad(q.cfg.buffer);
+      const Rect r = obs_rect(b_obs);
 
       const int hx0 = std::max(
           0, static_cast<int>(std::lower_bound(xs.begin(), xs.end(), r.l) -

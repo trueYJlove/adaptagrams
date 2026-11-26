@@ -14,6 +14,7 @@
 #include <utility>
 
 #include "channel_nudger.h"
+#include "geometry_utils.h"
 
 namespace localroute {
 namespace {
@@ -122,6 +123,47 @@ std::vector<Point> SimplifyOrtho(std::vector<Point> pts) {
   return pts;
 }
 
+std::vector<Point> CompactFallback(Point a, Point b, const Pin& sp,
+                                   const Pin& dp) {
+  if (a == b) {
+    return {a, b};
+  }
+  const unsigned sd = PrimaryDir(sp.dirs);
+  const unsigned dd = PrimaryDir(dp.dirs);
+  if (a.x == b.x || a.y == b.y) {
+    return {a, b};
+  }
+  if ((sd & (kLeft | kRight)) && (dd & (kLeft | kRight))) {
+    const double mid_x = (a.x + b.x) * 0.5;
+    return SimplifyOrtho({a, {mid_x, a.y}, {mid_x, b.y}, b});
+  }
+  if ((sd & (kUp | kDown)) && (dd & (kUp | kDown))) {
+    const double mid_y = (a.y + b.y) * 0.5;
+    return SimplifyOrtho({a, {a.x, mid_y}, {b.x, mid_y}, b});
+  }
+  return Elbow(a, b, (sd & (kLeft | kRight)) != 0);
+}
+
+double ComputeTerminalBufferFromIndex(
+    const SpatialGridIndex& index, const std::unordered_map<Id, Block>& blocks,
+    const Conn& c, Point pin_pt, double base_buffer) {
+  double buf = base_buffer;
+  for (Id id : index.Query(Box(pin_pt, pin_pt).Pad(base_buffer))) {
+    if (id == c.src || id == c.dst) {
+      continue;
+    }
+    const Rect r = blocks.at(id).rect;
+    if (r.Inside(pin_pt)) {
+      continue;
+    }
+    const double g = RectPointGap(r, pin_pt);
+    if (g < base_buffer) {
+      buf = std::min(buf, std::max(0.0, g * 0.5 - 0.5));
+    }
+  }
+  return buf;
+}
+
 std::vector<Point> MakeSimulinkFallback(Point a, Point b, const Block& src,
                                         const Block& dst, const Pin& sp,
                                         const Pin& dp, const Config& cfg) {
@@ -147,6 +189,12 @@ std::vector<Point> MakeSimulinkFallback(Point a, Point b, const Block& src,
   if (sd == kUp && dd == kDown && std::abs(a.x - b.x) <= 1e-3 &&
       b.y <= a.y + 1e-6) {
     return {a, b};
+  }
+
+  // Only emit the 5-segment outer loop when src and dst actually overlap or
+  // touch within buffer clearance; otherwise keep a compact L/Z fallback.
+  if (!src.rect.Pad(cfg.buffer).Intersects(dst.rect.Pad(cfg.buffer))) {
+    return CompactFallback(a, b, sp, dp);
   }
 
   const Rect u{
@@ -339,8 +387,12 @@ bool LocalOrthogonalRouter::ValidateAndSimplifyRoute(
   const Pin dp = FindPin(dst, c.dp);
   const Point a = PinPosition(src.rect, sp);
   const Point b = PinPosition(dst.rect, dp);
-  const Rect aa = src.rect.Pad(cfg_.buffer);
-  const Rect bb = dst.rect.Pad(cfg_.buffer);
+  const double src_buf =
+      ComputeTerminalBufferFromIndex(index_, blocks_, c, a, cfg_.buffer);
+  const double dst_buf =
+      ComputeTerminalBufferFromIndex(index_, blocks_, c, b, cfg_.buffer);
+  const Rect aa = src.rect.Pad(src_buf);
+  const Rect bb = dst.rect.Pad(dst_buf);
 
   auto& p = *points;
   if (!std::all_of(p.begin(), p.end(), FinitePoint)) {
@@ -369,7 +421,13 @@ bool LocalOrthogonalRouter::ValidateAndSimplifyRoute(
       return false;
     }
     for (Id id : index_.Query(Box(u, v).Pad(cfg_.buffer))) {
-      const Rect rect = blocks_.at(id).rect.Pad(cfg_.buffer);
+      const Rect raw = blocks_.at(id).rect;
+      const double buf =
+          (id == c.src)
+              ? src_buf
+              : (id == c.dst ? dst_buf
+                             : EffectiveObstacleBuffer(raw, a, b, cfg_.buffer));
+      const Rect rect = raw.Pad(buf);
       if (!Crosses(u, v, rect)) {
         continue;
       }
@@ -457,18 +515,37 @@ Route LocalOrthogonalRouter::SolveOne(const Conn& c, bool settled) const {
     Stopwatch clock(profile ? &profile->query_ms : nullptr);
     return index_.Query(rect);
   };
-  const Rect aa = src.rect.Pad(cfg_.buffer);
-  const Rect bb = dst.rect.Pad(cfg_.buffer);
-  // A terminal buried inside another buffered rectangle has no legal exit.
-  for (const auto& end : {std::make_pair(a, c.src), std::make_pair(b, c.dst)}) {
-    for (Id id : query(Box(end.first, end.first).Pad(cfg_.buffer))) {
-      if (id != end.second &&
-          blocks_.at(id).rect.Pad(cfg_.buffer).Inside(end.first)) {
-        out.outcome = Outcome::kBuriedPin;
-        return out;
+  double src_buf = cfg_.buffer;
+  double dst_buf = cfg_.buffer;
+  bool any_pin_pinched = false;
+  // Only a terminal buried inside another block's solid body has no legal exit;
+  // narrow buffer gaps are handled dynamically via shrunk obstacle buffers.
+  auto inspect_terminal = [&](Point pt, Id own_id, double* out_buf) {
+    for (Id id : query(Box(pt, pt).Pad(cfg_.buffer))) {
+      if (id == own_id) {
+        continue;
+      }
+      const Rect r = blocks_.at(id).rect;
+      if (r.Inside(pt)) {
+        return true;
+      }
+      if (id != c.src && id != c.dst) {
+        const double g = RectPointGap(r, pt);
+        if (g < cfg_.buffer) {
+          any_pin_pinched = true;
+          *out_buf = std::min(*out_buf, std::max(0.0, g * 0.5 - 0.5));
+        }
       }
     }
+    return false;
+  };
+  if (inspect_terminal(a, c.src, &src_buf) ||
+      inspect_terminal(b, c.dst, &dst_buf)) {
+    out.outcome = Outcome::kBuriedPin;
+    return out;
   }
+  const Rect aa = src.rect.Pad(src_buf);
+  const Rect bb = dst.rect.Pad(dst_buf);
 
   std::set<Id> required{c.src, c.dst};
   auto accept = [&](std::vector<Point> p, RouteMethod method) {
@@ -509,7 +586,16 @@ Route LocalOrthogonalRouter::SolveOne(const Conn& c, bool settled) const {
         return invalid();
       }
       for (Id id : index_.Query(Box(u, v).Pad(cfg_.buffer))) {
-        const Rect rect = blocks_.at(id).rect.Pad(cfg_.buffer);
+        const Rect raw = blocks_.at(id).rect;
+        double buf = cfg_.buffer;
+        if (any_pin_pinched) {
+          buf = (id == c.src)
+                    ? src_buf
+                    : (id == c.dst
+                           ? dst_buf
+                           : EffectiveObstacleBuffer(raw, a, b, cfg_.buffer));
+        }
+        const Rect rect = raw.Pad(buf);
         if (!Crosses(u, v, rect)) {
           continue;
         }
