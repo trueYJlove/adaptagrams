@@ -7,6 +7,8 @@ add_executable(qt_demo
     main_window.cc
     canvas_widget.h
     canvas_widget.cc
+    library_widget.h
+    library_widget.cc
 )
 
 target_include_directories(qt_demo PRIVATE

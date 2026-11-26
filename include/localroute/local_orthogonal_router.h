@@ -28,6 +28,9 @@ class LocalOrthogonalRouter {
   std::vector<Id> RerouteAffected(const std::vector<Id>& moved,
                                   bool settled = false);
   void RouteAllParallel(unsigned threads = 0);
+  void RouteConnector(Id id);
+  void MarkConnector(Id id);
+  LocalOrthogonalRouter Clone() const { return *this; }
   std::vector<Point> Preview(Id id) const;
   void set_reroute_third_party_blocked(bool enabled);
 

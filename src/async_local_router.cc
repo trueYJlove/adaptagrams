@@ -41,6 +41,17 @@ void AsyncLocalRouter::StartAll() {
   Refresh();
 }
 
+void AsyncLocalRouter::StartDirty() {
+  if (model_.dirty_.empty()) {
+    return;
+  }
+  auto affected = std::move(model_.dirty_);
+  model_.dirty_.clear();
+  std::lock_guard<std::mutex> lock(mutex_);
+  pending_.merge(affected);
+  Refresh();
+}
+
 void AsyncLocalRouter::Move(const std::vector<std::pair<Id, Rect>>& moves) {
   if (moves.empty()) {
     return;

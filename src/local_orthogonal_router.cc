@@ -509,6 +509,15 @@ std::vector<Id> LocalOrthogonalRouter::RerouteAffected(
   return {ids.begin(), ids.end()};
 }
 
+void LocalOrthogonalRouter::RouteConnector(Id id) {
+  Publish(id, SolveOne(conns_.at(id), false));
+}
+
+void LocalOrthogonalRouter::MarkConnector(Id id) {
+  (void)conns_.at(id);
+  Mark(id);
+}
+
 void LocalOrthogonalRouter::RouteAllParallel(unsigned threads) {
   std::vector<Id> ids;
   ids.reserve(conns_.size());

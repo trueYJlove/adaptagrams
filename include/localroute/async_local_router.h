@@ -28,6 +28,7 @@ class AsyncLocalRouter {
   AsyncLocalRouter& operator=(const AsyncLocalRouter&) = delete;
 
   void StartAll();
+  void StartDirty();
   void Move(const std::vector<std::pair<Id, Rect>>& moves);
   void Prioritize(Rect viewport, const std::vector<Id>& selection = {});
   void Settle();

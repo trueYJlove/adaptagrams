@@ -1,7 +1,14 @@
 #include "canvas_widget.h"
 
+#include <QContextMenuEvent>
+#include <QDragEnterEvent>
+#include <QDragLeaveEvent>
+#include <QDragMoveEvent>
+#include <QDropEvent>
 #include <QKeyEvent>
 #include <QLineF>
+#include <QMenu>
+#include <QMimeData>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QVector>
@@ -42,11 +49,81 @@ localroute::Rect PointsBounds(const std::vector<localroute::Point>& pts) {
   return {l, t, r, b};
 }
 
+enum class PinSide { kLeft = 0, kRight = 1, kTop = 2, kBottom = 3 };
+
+PinSide ClassifyPinSide(const localroute::Pin& p) {
+  if (p.dirs & localroute::kLeft) {
+    return PinSide::kLeft;
+  }
+  if (p.dirs & localroute::kRight) {
+    return PinSide::kRight;
+  }
+  if (p.dirs & localroute::kUp) {
+    return PinSide::kTop;
+  }
+  if (p.dirs & localroute::kDown) {
+    return PinSide::kBottom;
+  }
+  if (p.x <= 0.1) {
+    return PinSide::kLeft;
+  }
+  if (p.x >= 0.9) {
+    return PinSide::kRight;
+  }
+  return p.y <= 0.5 ? PinSide::kTop : PinSide::kBottom;
+}
+
+std::vector<localroute::Pin> BuildPinsForCounts(int left, int right, int top,
+                                                int bottom) {
+  std::vector<localroute::Pin> pins;
+  pins.reserve(static_cast<std::size_t>(left + right + top + bottom));
+  for (int i = 0; i < left; ++i) {
+    pins.push_back({static_cast<localroute::Id>(100 + i), 0.0,
+                    static_cast<double>(i + 1) / (left + 1),
+                    localroute::kLeft});
+  }
+  for (int i = 0; i < right; ++i) {
+    pins.push_back({static_cast<localroute::Id>(200 + i), 1.0,
+                    static_cast<double>(i + 1) / (right + 1),
+                    localroute::kRight});
+  }
+  for (int i = 0; i < top; ++i) {
+    pins.push_back({static_cast<localroute::Id>(300 + i),
+                    static_cast<double>(i + 1) / (top + 1), 0.0,
+                    localroute::kUp});
+  }
+  for (int i = 0; i < bottom; ++i) {
+    pins.push_back({static_cast<localroute::Id>(400 + i),
+                    static_cast<double>(i + 1) / (bottom + 1), 1.0,
+                    localroute::kDown});
+  }
+  return pins;
+}
+
+double PointToSegDistSq(QPointF p, QPointF a, QPointF b) {
+  const double vx = b.x() - a.x();
+  const double vy = b.y() - a.y();
+  const double len_sq = vx * vx + vy * vy;
+  if (len_sq <= 1e-9) {
+    const double dx = p.x() - a.x();
+    const double dy = p.y() - a.y();
+    return dx * dx + dy * dy;
+  }
+  const double t = std::clamp(
+      ((p.x() - a.x()) * vx + (p.y() - a.y()) * vy) / len_sq, 0.0, 1.0);
+  const double px = a.x() + t * vx;
+  const double py = a.y() + t * vy;
+  const double dx = p.x() - px;
+  const double dy = p.y() - py;
+  return dx * dx + dy * dy;
+}
+
 }  // namespace
 
 CanvasWidget::CanvasWidget(QWidget* parent) : QWidget(parent) {
   setFocusPolicy(Qt::StrongFocus);
   setMouseTracking(true);
+  setAcceptDrops(true);
   setAutoFillBackground(false);
   fps_clock_.start();
 
@@ -65,18 +142,72 @@ const localroute::LocalOrthogonalRouter& CanvasWidget::ActiveView() const {
                                                        : *sync_router_;
 }
 
-localroute::LocalOrthogonalRouter CanvasWidget::ExtractModelCopy() const {
-  const auto& view = ActiveView();
-  localroute::Config cfg = view.config();
-  cfg.reroute_third_party_blocked = third_party_reroute_;
-  localroute::LocalOrthogonalRouter copy(cfg);
-  for (const auto& kv : view.all_blocks()) {
-    copy.AddBlock(kv.second);
+void CanvasWidget::RefreshWorldBounds() {
+  const auto& blocks = ActiveView().all_blocks();
+  if (blocks.empty()) {
+    world_bounds_ = {-400.0, -300.0, 400.0, 300.0};
+    return;
   }
-  for (const auto& kv : view.all_conns()) {
-    copy.AddConnector(kv.second);
+  double min_x = std::numeric_limits<double>::max();
+  double min_y = std::numeric_limits<double>::max();
+  double max_x = std::numeric_limits<double>::lowest();
+  double max_y = std::numeric_limits<double>::lowest();
+  for (const auto& kv : blocks) {
+    const auto& r = kv.second.rect;
+    min_x = std::min(min_x, r.l);
+    min_y = std::min(min_y, r.t);
+    max_x = std::max(max_x, r.r);
+    max_y = std::max(max_y, r.b);
   }
-  return copy;
+  world_bounds_ = {min_x, min_y, max_x, max_y};
+}
+
+void CanvasWidget::ApplyModelEdit(
+    const std::function<std::vector<localroute::Id>(
+        localroute::LocalOrthogonalRouter*)>& edit_fn) {
+  QElapsedTimer timer;
+  timer.start();
+  if (mode_ == RouteMode::kSync && sync_router_) {
+    const std::vector<localroute::Id> route_conn_ids =
+        edit_fn(sync_router_.get());
+    for (localroute::Id cid : route_conn_ids) {
+      if (sync_router_->all_conns().count(cid)) {
+        sync_router_->RouteConnector(cid);
+      }
+    }
+    (void)sync_router_->RerouteAffected({});
+    route_time_ms_ = static_cast<double>(timer.nsecsElapsed()) / 1e6;
+  } else if (mode_ == RouteMode::kAsync && async_router_) {
+    async_timer_.stop();
+    localroute::LocalOrthogonalRouter model = async_router_->view().Clone();
+    async_router_.reset();
+    const std::vector<localroute::Id> route_conn_ids = edit_fn(&model);
+    for (localroute::Id cid : route_conn_ids) {
+      if (model.all_conns().count(cid)) {
+        model.MarkConnector(cid);
+      }
+    }
+    async_router_ =
+        std::make_unique<localroute::AsyncLocalRouter>(std::move(model));
+    async_router_->Prioritize(WorldViewportRect(), std::vector<localroute::Id>(
+                                                       selected_blocks_.begin(),
+                                                       selected_blocks_.end()));
+    async_router_->StartDirty();
+    route_time_ms_ = static_cast<double>(timer.nsecsElapsed()) / 1e6;
+    if (async_router_->PendingCount() > 0) {
+      async_timer_.start();
+    }
+  }
+
+  current_block_count_ =
+      static_cast<unsigned>(ActiveView().all_blocks().size());
+  current_conn_count_ = static_cast<unsigned>(ActiveView().all_conns().size());
+  RefreshWorldBounds();
+  RecordRouteSample(route_time_ms_);
+  RebuildRouteCache();
+  update();
+  emit StatusChanged();
+  emit SelectionChanged();
 }
 
 void CanvasWidget::LoadTopology(unsigned block_count) {
@@ -85,34 +216,33 @@ void CanvasWidget::LoadTopology(unsigned block_count) {
   sync_router_.reset();
   selected_blocks_.clear();
   highlighted_conns_.clear();
+  has_selected_conn_ = false;
+  selected_conn_id_ = 0;
+  hover_pin_ = PinHit{};
+  wire_src_ = PinHit{};
   route_samples_ms_.clear();
   drag_kind_ = DragKind::kNone;
-
-  const localroute::Topology top = localroute::GenerateTopology(block_count);
-  current_block_count_ = static_cast<unsigned>(top.blocks.size());
-  current_conn_count_ = static_cast<unsigned>(top.conns.size());
-
-  double min_x = std::numeric_limits<double>::max();
-  double min_y = std::numeric_limits<double>::max();
-  double max_x = std::numeric_limits<double>::lowest();
-  double max_y = std::numeric_limits<double>::lowest();
-  for (const auto& b : top.blocks) {
-    min_x = std::min(min_x, b.rect.l);
-    min_y = std::min(min_y, b.rect.t);
-    max_x = std::max(max_x, b.rect.r);
-    max_y = std::max(max_y, b.rect.b);
-  }
-  world_bounds_ = {min_x, min_y, max_x, max_y};
 
   localroute::Config cfg;
   cfg.reroute_third_party_blocked = third_party_reroute_;
   localroute::LocalOrthogonalRouter initial(cfg);
-  for (const auto& b : top.blocks) {
-    initial.AddBlock(b);
+
+  next_block_id_ = 1;
+  next_conn_id_ = 1;
+  if (block_count > 0) {
+    const localroute::Topology top = localroute::GenerateTopology(block_count);
+    for (const auto& b : top.blocks) {
+      initial.AddBlock(b);
+      next_block_id_ = std::max(next_block_id_, b.id + 1);
+    }
+    for (const auto& c : top.conns) {
+      initial.AddConnector(c);
+      next_conn_id_ = std::max(next_conn_id_, c.id + 1);
+    }
   }
-  for (const auto& c : top.conns) {
-    initial.AddConnector(c);
-  }
+
+  current_block_count_ = static_cast<unsigned>(initial.all_blocks().size());
+  current_conn_count_ = static_cast<unsigned>(initial.all_conns().size());
 
   QElapsedTimer timer;
   timer.start();
@@ -126,6 +256,7 @@ void CanvasWidget::LoadTopology(unsigned block_count) {
   }
   double setup_ms = static_cast<double>(timer.nsecsElapsed()) / 1e6;
 
+  RefreshWorldBounds();
   RebuildRouteCache();
   ResetLocalView();
 
@@ -136,13 +267,16 @@ void CanvasWidget::LoadTopology(unsigned block_count) {
     async_router_->StartAll();
     setup_ms += static_cast<double>(start_timer.nsecsElapsed()) / 1e6;
     RebuildRouteCache();
-    async_timer_.start();
+    if (async_router_->PendingCount() > 0) {
+      async_timer_.start();
+    }
   }
 
   route_time_ms_ = setup_ms;
   RecordRouteSample(setup_ms);
   update();
   emit StatusChanged();
+  emit SelectionChanged();
 }
 
 void CanvasWidget::SetRouteMode(RouteMode new_mode) {
@@ -150,7 +284,8 @@ void CanvasWidget::SetRouteMode(RouteMode new_mode) {
     return;
   }
   async_timer_.stop();
-  localroute::LocalOrthogonalRouter model = ExtractModelCopy();
+  localroute::LocalOrthogonalRouter model = ActiveView().Clone();
+  model.set_reroute_third_party_blocked(third_party_reroute_);
   async_router_.reset();
   sync_router_.reset();
   mode_ = new_mode;
@@ -168,7 +303,9 @@ void CanvasWidget::SetRouteMode(RouteMode new_mode) {
                                                        selected_blocks_.begin(),
                                                        selected_blocks_.end()));
     async_router_->StartAll();
-    async_timer_.start();
+    if (async_router_->PendingCount() > 0) {
+      async_timer_.start();
+    }
   }
   route_time_ms_ = static_cast<double>(timer.nsecsElapsed()) / 1e6;
   RecordRouteSample(route_time_ms_);
@@ -203,7 +340,9 @@ void CanvasWidget::RouteAll() {
                                                        selected_blocks_.end()));
     async_router_->StartAll();
     route_time_ms_ = static_cast<double>(timer.nsecsElapsed()) / 1e6;
-    async_timer_.start();
+    if (async_router_->PendingCount() > 0) {
+      async_timer_.start();
+    }
   }
   RecordRouteSample(route_time_ms_);
   RebuildRouteCache();
@@ -212,6 +351,7 @@ void CanvasWidget::RouteAll() {
 }
 
 void CanvasWidget::FitAll() {
+  RefreshWorldBounds();
   const double bw = std::max(1.0, world_bounds_.r - world_bounds_.l);
   const double bh = std::max(1.0, world_bounds_.b - world_bounds_.t);
   const double vw = std::max(100.0, static_cast<double>(width()) - 40.0);
@@ -241,10 +381,258 @@ void CanvasWidget::ResetLocalView() {
     pan_offset_ =
         QPointF(width() * 0.5 - cx * zoom_, height() * 0.5 - cy * zoom_);
   } else {
-    pan_offset_ = QPointF(40.0, 40.0);
+    pan_offset_ = QPointF(width() * 0.5, height() * 0.5);
   }
   UpdateViewportPriority();
   update();
+}
+
+localroute::Id CanvasWidget::AddBlockFromTemplate(const BlockTemplate& tmpl,
+                                                  QPointF world_center) {
+  const localroute::Id new_id = next_block_id_++;
+  const double min_h = std::max(
+      tmpl.height, std::max(tmpl.left_pins, tmpl.right_pins) * 20.0 + 16.0);
+  const double min_w = std::max(
+      tmpl.width, std::max(tmpl.top_pins, tmpl.bottom_pins) * 24.0 + 20.0);
+  const localroute::Rect rect{
+      world_center.x() - min_w * 0.5, world_center.y() - min_h * 0.5,
+      world_center.x() + min_w * 0.5, world_center.y() + min_h * 0.5};
+  localroute::Block blk{new_id, rect,
+                        BuildPinsForCounts(tmpl.left_pins, tmpl.right_pins,
+                                           tmpl.top_pins, tmpl.bottom_pins)};
+
+  selected_blocks_.clear();
+  selected_blocks_.insert(new_id);
+  has_selected_conn_ = false;
+  highlighted_conns_.clear();
+
+  ApplyModelEdit([blk = std::move(blk)](localroute::LocalOrthogonalRouter* r) {
+    r->AddBlock(blk);
+    return std::vector<localroute::Id>{};
+  });
+  return new_id;
+}
+
+localroute::Id CanvasWidget::SpawnBlockAtCenter(const BlockTemplate& tmpl) {
+  QPointF center = ScreenToWorld(QPointF(width() * 0.5, height() * 0.5));
+  const double jitter = static_cast<double>((next_block_id_ % 5) * 18) - 36.0;
+  center += QPointF(jitter, jitter);
+  return AddBlockFromTemplate(tmpl, center);
+}
+
+bool CanvasWidget::GetSelectedBlockPorts(localroute::Id* block_id, int* left,
+                                         int* right, int* top,
+                                         int* bottom) const {
+  if (selected_blocks_.size() != 1) {
+    return false;
+  }
+  const localroute::Id id = *selected_blocks_.begin();
+  const auto& blocks = ActiveView().all_blocks();
+  const auto it = blocks.find(id);
+  if (it == blocks.end()) {
+    return false;
+  }
+  int l = 0;
+  int r = 0;
+  int t = 0;
+  int b = 0;
+  for (const auto& p : it->second.pins) {
+    switch (ClassifyPinSide(p)) {
+      case PinSide::kLeft:
+        ++l;
+        break;
+      case PinSide::kRight:
+        ++r;
+        break;
+      case PinSide::kTop:
+        ++t;
+        break;
+      case PinSide::kBottom:
+        ++b;
+        break;
+    }
+  }
+  if (block_id) {
+    *block_id = id;
+  }
+  if (left) {
+    *left = l;
+  }
+  if (right) {
+    *right = r;
+  }
+  if (top) {
+    *top = t;
+  }
+  if (bottom) {
+    *bottom = b;
+  }
+  return true;
+}
+
+void CanvasWidget::SetSelectedBlockPorts(int left, int right, int top,
+                                         int bottom) {
+  if (selected_blocks_.size() != 1) {
+    return;
+  }
+  SetBlockPorts(*selected_blocks_.begin(), left, right, top, bottom);
+}
+
+void CanvasWidget::SetBlockPorts(localroute::Id block_id, int left, int right,
+                                 int top, int bottom) {
+  left = std::clamp(left, 0, 16);
+  right = std::clamp(right, 0, 16);
+  top = std::clamp(top, 0, 8);
+  bottom = std::clamp(bottom, 0, 8);
+
+  const auto& view = ActiveView();
+  if (!view.all_blocks().count(block_id)) {
+    return;
+  }
+
+  ApplyModelEdit([&](localroute::LocalOrthogonalRouter* r) {
+    const localroute::Block old_blk = r->block(block_id);
+
+    std::array<std::vector<localroute::Pin>, 4> old_by_side;
+    for (const auto& p : old_blk.pins) {
+      old_by_side[static_cast<int>(ClassifyPinSide(p))].push_back(p);
+    }
+    auto sort_y = [](const localroute::Pin& a, const localroute::Pin& b) {
+      return a.y != b.y ? a.y < b.y : a.id < b.id;
+    };
+    auto sort_x = [](const localroute::Pin& a, const localroute::Pin& b) {
+      return a.x != b.x ? a.x < b.x : a.id < b.id;
+    };
+    std::sort(old_by_side[0].begin(), old_by_side[0].end(), sort_y);
+    std::sort(old_by_side[1].begin(), old_by_side[1].end(), sort_y);
+    std::sort(old_by_side[2].begin(), old_by_side[2].end(), sort_x);
+    std::sort(old_by_side[3].begin(), old_by_side[3].end(), sort_x);
+
+    const int new_counts[4] = {left, right, top, bottom};
+    const localroute::Id side_base[4] = {100, 200, 300, 400};
+    std::unordered_map<localroute::Id, localroute::Id> pin_remap;
+    for (int s = 0; s < 4; ++s) {
+      const int keep =
+          std::min(new_counts[s], static_cast<int>(old_by_side[s].size()));
+      for (int i = 0; i < keep; ++i) {
+        pin_remap.emplace(old_by_side[s][i].id,
+                          side_base[s] + static_cast<localroute::Id>(i));
+      }
+    }
+
+    std::vector<localroute::Conn> preserved_conns;
+    for (localroute::Id cid : r->adjacent_conns(block_id)) {
+      localroute::Conn c = r->all_conns().at(cid);
+      bool keep = true;
+      if (c.src == block_id) {
+        const auto it = pin_remap.find(c.sp);
+        if (it == pin_remap.end()) {
+          keep = false;
+        } else {
+          c.sp = it->second;
+        }
+      }
+      if (keep && c.dst == block_id) {
+        const auto it = pin_remap.find(c.dp);
+        if (it == pin_remap.end()) {
+          keep = false;
+        } else {
+          c.dp = it->second;
+        }
+      }
+      if (keep) {
+        preserved_conns.push_back(c);
+      }
+    }
+
+    const double cur_w = old_blk.rect.r - old_blk.rect.l;
+    const double cur_h = old_blk.rect.b - old_blk.rect.t;
+    const double cx = (old_blk.rect.l + old_blk.rect.r) * 0.5;
+    const double cy = (old_blk.rect.t + old_blk.rect.b) * 0.5;
+    const double new_h = std::max(cur_h, std::max(left, right) * 20.0 + 16.0);
+    const double new_w = std::max(cur_w, std::max(top, bottom) * 24.0 + 20.0);
+    const localroute::Rect new_rect{cx - new_w * 0.5, cy - new_h * 0.5,
+                                    cx + new_w * 0.5, cy + new_h * 0.5};
+
+    r->RemoveBlock(block_id);
+    r->AddBlock(
+        {block_id, new_rect, BuildPinsForCounts(left, right, top, bottom)});
+    std::vector<localroute::Id> to_route;
+    to_route.reserve(preserved_conns.size());
+    for (const auto& c : preserved_conns) {
+      r->AddConnector(c);
+      to_route.push_back(c.id);
+    }
+    return to_route;
+  });
+
+  highlighted_conns_.clear();
+  for (localroute::Id cid : ActiveView().adjacent_conns(block_id)) {
+    highlighted_conns_.insert(cid);
+  }
+  update();
+}
+
+localroute::Id CanvasWidget::AddWire(localroute::Id src_block,
+                                     localroute::Id src_pin,
+                                     localroute::Id dst_block,
+                                     localroute::Id dst_pin) {
+  const localroute::Id new_cid = next_conn_id_++;
+  const localroute::Conn conn{new_cid, src_block, src_pin, dst_block, dst_pin};
+  has_selected_conn_ = true;
+  selected_conn_id_ = new_cid;
+  highlighted_conns_.clear();
+  highlighted_conns_.insert(new_cid);
+
+  ApplyModelEdit([conn, new_cid](localroute::LocalOrthogonalRouter* r) {
+    r->AddConnector(conn);
+    return std::vector<localroute::Id>{new_cid};
+  });
+  return new_cid;
+}
+
+void CanvasWidget::DeleteSelection() {
+  if (has_selected_conn_) {
+    const localroute::Id cid = selected_conn_id_;
+    has_selected_conn_ = false;
+    highlighted_conns_.erase(cid);
+    ApplyModelEdit([cid](localroute::LocalOrthogonalRouter* r) {
+      if (r->all_conns().count(cid)) {
+        r->RemoveConnector(cid);
+      }
+      return std::vector<localroute::Id>{};
+    });
+    return;
+  }
+  if (!selected_blocks_.empty()) {
+    const std::vector<localroute::Id> to_del(selected_blocks_.begin(),
+                                             selected_blocks_.end());
+    selected_blocks_.clear();
+    highlighted_conns_.clear();
+    ApplyModelEdit([&](localroute::LocalOrthogonalRouter* r) {
+      for (localroute::Id bid : to_del) {
+        if (r->all_blocks().count(bid)) {
+          r->RemoveBlock(bid);
+        }
+      }
+      return std::vector<localroute::Id>{};
+    });
+  }
+}
+
+void CanvasWidget::ClearBlockWires(localroute::Id block_id) {
+  if (!ActiveView().all_blocks().count(block_id)) {
+    return;
+  }
+  highlighted_conns_.clear();
+  has_selected_conn_ = false;
+  ApplyModelEdit([block_id](localroute::LocalOrthogonalRouter* r) {
+    const auto conns = r->adjacent_conns(block_id);
+    for (localroute::Id cid : conns) {
+      r->RemoveConnector(cid);
+    }
+    return std::vector<localroute::Id>{};
+  });
 }
 
 void CanvasWidget::RebuildRouteCache() {
@@ -376,6 +764,10 @@ QPointF CanvasWidget::ScreenToWorld(const QPointF& p) const {
   return {(p.x() - pan_offset_.x()) / zoom_, (p.y() - pan_offset_.y()) / zoom_};
 }
 
+QPointF CanvasWidget::WorldToScreen(const QPointF& p) const {
+  return {p.x() * zoom_ + pan_offset_.x(), p.y() * zoom_ + pan_offset_.y()};
+}
+
 localroute::Id CanvasWidget::HitTestBlock(const QPointF& world_pos) const {
   const auto& view = ActiveView();
   const localroute::Rect probe{world_pos.x() - 1.0, world_pos.y() - 1.0,
@@ -389,6 +781,72 @@ localroute::Id CanvasWidget::HitTestBlock(const QPointF& world_pos) const {
     }
   }
   return std::numeric_limits<localroute::Id>::max();
+}
+
+CanvasWidget::PinHit CanvasWidget::HitTestPin(const QPointF& screen_pos,
+                                              double max_px) const {
+  if (zoom_ < 0.25) {
+    return PinHit{};
+  }
+  const QPointF world_pos = ScreenToWorld(screen_pos);
+  const double pad = max_px / zoom_ + 4.0;
+  const localroute::Rect probe{world_pos.x() - pad, world_pos.y() - pad,
+                               world_pos.x() + pad, world_pos.y() + pad};
+  const auto& view = ActiveView();
+  PinHit best;
+  double best_dist_sq = max_px * max_px;
+  for (localroute::Id bid : view.QueryBlocks(probe)) {
+    const auto& b = view.block(bid);
+    for (const auto& p : b.pins) {
+      const localroute::Point wp = PinPos(b, p.id);
+      const QPointF sp = WorldToScreen(QPointF(wp.x, wp.y));
+      const double dx = sp.x() - screen_pos.x();
+      const double dy = sp.y() - screen_pos.y();
+      const double d2 = dx * dx + dy * dy;
+      if (d2 <= best_dist_sq) {
+        best_dist_sq = d2;
+        best = {true, bid, p.id, wp};
+      }
+    }
+  }
+  return best;
+}
+
+bool CanvasWidget::HitTestWire(const QPointF& screen_pos,
+                               localroute::Id* out_conn_id) const {
+  const QPointF world_pos = ScreenToWorld(screen_pos);
+  const double tol_world = 7.0 / zoom_;
+  const double tol_sq = 49.0;  // 7px in screen space
+  const localroute::Rect probe{
+      world_pos.x() - tol_world, world_pos.y() - tol_world,
+      world_pos.x() + tol_world, world_pos.y() + tol_world};
+  const auto& view = ActiveView();
+  const auto& routes = view.all_routes();
+  for (const auto& entry : route_cache_) {
+    if (!entry.bounds.Intersects(probe)) {
+      continue;
+    }
+    std::vector<localroute::Point> pts;
+    const auto rit = routes.find(entry.id);
+    if (rit == routes.end() ||
+        rit->second.status == localroute::Status::kPending ||
+        rit->second.points.empty()) {
+      pts = view.Preview(entry.id);
+    } else {
+      pts = rit->second.points;
+    }
+    for (std::size_t j = 1; j < pts.size(); ++j) {
+      const QPointF a = WorldToScreen(QPointF(pts[j - 1].x, pts[j - 1].y));
+      const QPointF b = WorldToScreen(QPointF(pts[j].x, pts[j].y));
+      if (PointToSegDistSq(screen_pos, a, b) <= tol_sq) {
+        if (out_conn_id) {
+          *out_conn_id = entry.id;
+        }
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 void CanvasWidget::StepSmokeDrag(const std::vector<localroute::Id>& ids,
@@ -480,11 +938,26 @@ void CanvasWidget::mousePressEvent(QMouseEvent* event) {
     return;
   }
 
+  // 1. Check pin hit first so user can drag wires directly from any port.
+  const PinHit pin_hit = HitTestPin(event->pos(), 12.0);
+  if (pin_hit.valid) {
+    drag_kind_ = DragKind::kWiring;
+    wire_src_ = pin_hit;
+    drag_start_world_ = QPointF(pin_hit.world_pos.x, pin_hit.world_pos.y);
+    drag_current_world_ = drag_start_world_;
+    hover_pin_ = PinHit{};
+    setCursor(Qt::CrossCursor);
+    update();
+    return;
+  }
+
+  // 2. Check block hit for selection / drag.
   const QPointF world_pos = ScreenToWorld(event->pos());
   const localroute::Id hit = HitTestBlock(world_pos);
   const auto& view = ActiveView();
 
   if (hit != std::numeric_limits<localroute::Id>::max()) {
+    has_selected_conn_ = false;
     if (event->modifiers() & Qt::ControlModifier) {
       if (selected_blocks_.count(hit)) {
         selected_blocks_.erase(hit);
@@ -507,16 +980,35 @@ void CanvasWidget::mousePressEvent(QMouseEvent* event) {
     }
     UpdateViewportPriority();
     update();
-  } else {
-    if (!(event->modifiers() & Qt::ControlModifier)) {
-      selected_blocks_.clear();
-    }
-    highlighted_conns_.clear();
-    drag_kind_ = DragKind::kRubberBand;
-    drag_start_world_ = world_pos;
-    drag_current_world_ = world_pos;
-    update();
+    emit SelectionChanged();
+    return;
   }
+
+  // 3. Check wire hit to allow clicking & deleting a wire.
+  localroute::Id hit_cid = 0;
+  if (!(event->modifiers() & Qt::ControlModifier) &&
+      HitTestWire(event->pos(), &hit_cid)) {
+    selected_blocks_.clear();
+    highlighted_conns_.clear();
+    highlighted_conns_.insert(hit_cid);
+    has_selected_conn_ = true;
+    selected_conn_id_ = hit_cid;
+    update();
+    emit SelectionChanged();
+    return;
+  }
+
+  // 4. Empty space: rubber-band multi-select.
+  if (!(event->modifiers() & Qt::ControlModifier)) {
+    selected_blocks_.clear();
+  }
+  has_selected_conn_ = false;
+  highlighted_conns_.clear();
+  drag_kind_ = DragKind::kRubberBand;
+  drag_start_world_ = world_pos;
+  drag_current_world_ = world_pos;
+  update();
+  emit SelectionChanged();
 }
 
 void CanvasWidget::mouseMoveEvent(QMouseEvent* event) {
@@ -530,6 +1022,20 @@ void CanvasWidget::mouseMoveEvent(QMouseEvent* event) {
     return;
   }
   last_mouse_pos_ = pos;
+
+  if (drag_kind_ == DragKind::kWiring) {
+    drag_current_world_ = ScreenToWorld(pos);
+    const PinHit target = HitTestPin(pos, 14.0);
+    if (target.valid && (target.block_id != wire_src_.block_id ||
+                         target.pin_id != wire_src_.pin_id)) {
+      hover_pin_ = target;
+      drag_current_world_ = QPointF(target.world_pos.x, target.world_pos.y);
+    } else {
+      hover_pin_ = PinHit{};
+    }
+    update();
+    return;
+  }
 
   if (drag_kind_ == DragKind::kRubberBand) {
     drag_current_world_ = ScreenToWorld(pos);
@@ -582,6 +1088,20 @@ void CanvasWidget::mouseMoveEvent(QMouseEvent* event) {
     RecordRouteSample(route_time_ms_);
     update();
     emit StatusChanged();
+    return;
+  }
+
+  // Idle hover highlight on pins
+  if (drag_kind_ == DragKind::kNone && !space_pressed_) {
+    const PinHit p = HitTestPin(pos, 12.0);
+    const bool changed = (p.valid != hover_pin_.valid) ||
+                         (p.valid && (p.block_id != hover_pin_.block_id ||
+                                      p.pin_id != hover_pin_.pin_id));
+    if (changed) {
+      hover_pin_ = p;
+      setCursor(hover_pin_.valid ? Qt::CrossCursor : Qt::ArrowCursor);
+      update();
+    }
   }
 }
 
@@ -592,6 +1112,23 @@ void CanvasWidget::mouseReleaseEvent(QMouseEvent* event) {
     return;
   }
   if (event->button() != Qt::LeftButton) {
+    return;
+  }
+
+  if (drag_kind_ == DragKind::kWiring) {
+    drag_kind_ = DragKind::kNone;
+    setCursor(Qt::ArrowCursor);
+    const PinHit target = hover_pin_;
+    hover_pin_ = PinHit{};
+    if (wire_src_.valid && target.valid &&
+        (target.block_id != wire_src_.block_id ||
+         target.pin_id != wire_src_.pin_id)) {
+      AddWire(wire_src_.block_id, wire_src_.pin_id, target.block_id,
+              target.pin_id);
+    } else {
+      update();
+    }
+    wire_src_ = PinHit{};
     return;
   }
 
@@ -616,6 +1153,7 @@ void CanvasWidget::mouseReleaseEvent(QMouseEvent* event) {
     drag_kind_ = DragKind::kNone;
     UpdateViewportPriority();
     update();
+    emit SelectionChanged();
     return;
   }
 
@@ -650,6 +1188,9 @@ void CanvasWidget::keyPressEvent(QKeyEvent* event) {
     if (drag_kind_ == DragKind::kNone) {
       setCursor(Qt::OpenHandCursor);
     }
+  } else if (event->key() == Qt::Key_Delete ||
+             event->key() == Qt::Key_Backspace) {
+    DeleteSelection();
   } else if (event->key() == Qt::Key_R) {
     ResetLocalView();
   } else if (event->key() == Qt::Key_F) {
@@ -675,6 +1216,120 @@ void CanvasWidget::resizeEvent(QResizeEvent* event) {
   UpdateViewportPriority();
 }
 
+void CanvasWidget::dragEnterEvent(QDragEnterEvent* event) {
+  if (event->mimeData()->hasFormat(kBlockTemplateMime)) {
+    BlockTemplate tmpl;
+    if (DecodeBlockTemplate(event->mimeData()->data(kBlockTemplateMime),
+                            &tmpl)) {
+      drop_ghost_tmpl_ = tmpl;
+      drop_ghost_world_ = ScreenToWorld(event->pos());
+      has_drop_ghost_ = true;
+      event->acceptProposedAction();
+      update();
+      return;
+    }
+  }
+  event->ignore();
+}
+
+void CanvasWidget::dragMoveEvent(QDragMoveEvent* event) {
+  if (event->mimeData()->hasFormat(kBlockTemplateMime)) {
+    drop_ghost_world_ = ScreenToWorld(event->pos());
+    has_drop_ghost_ = true;
+    event->acceptProposedAction();
+    update();
+    return;
+  }
+  event->ignore();
+}
+
+void CanvasWidget::dragLeaveEvent(QDragLeaveEvent* /*event*/) {
+  has_drop_ghost_ = false;
+  update();
+}
+
+void CanvasWidget::dropEvent(QDropEvent* event) {
+  has_drop_ghost_ = false;
+  if (event->mimeData()->hasFormat(kBlockTemplateMime)) {
+    BlockTemplate tmpl;
+    if (DecodeBlockTemplate(event->mimeData()->data(kBlockTemplateMime),
+                            &tmpl)) {
+      AddBlockFromTemplate(tmpl, ScreenToWorld(event->pos()));
+      setFocus();
+      event->acceptProposedAction();
+      return;
+    }
+  }
+  event->ignore();
+  update();
+}
+
+void CanvasWidget::contextMenuEvent(QContextMenuEvent* event) {
+  const QPointF world_pos = ScreenToWorld(event->pos());
+  const localroute::Id hit_blk = HitTestBlock(world_pos);
+  if (hit_blk != std::numeric_limits<localroute::Id>::max()) {
+    selected_blocks_.clear();
+    selected_blocks_.insert(hit_blk);
+    has_selected_conn_ = false;
+    emit SelectionChanged();
+    update();
+
+    localroute::Id bid = 0;
+    int l = 0;
+    int r = 0;
+    int t = 0;
+    int b = 0;
+    GetSelectedBlockPorts(&bid, &l, &r, &t, &b);
+
+    QMenu menu(this);
+    QAction* add_in = menu.addAction("+1 左输入端口");
+    QAction* sub_in = menu.addAction("-1 左输入端口");
+    sub_in->setEnabled(l > 0);
+    QAction* add_out = menu.addAction("+1 右输出端口");
+    QAction* sub_out = menu.addAction("-1 右输出端口");
+    sub_out->setEnabled(r > 0);
+    menu.addSeparator();
+    QAction* make_obs = menu.addAction("转为 0 端口障碍物");
+    QAction* clear_wires = menu.addAction("清除该模块连线");
+    QAction* del_blk = menu.addAction("删除模块 (Del)");
+
+    QAction* chosen = menu.exec(event->globalPos());
+    if (chosen == add_in) {
+      SetBlockPorts(bid, l + 1, r, t, b);
+    } else if (chosen == sub_in) {
+      SetBlockPorts(bid, l - 1, r, t, b);
+    } else if (chosen == add_out) {
+      SetBlockPorts(bid, l, r + 1, t, b);
+    } else if (chosen == sub_out) {
+      SetBlockPorts(bid, l, r - 1, t, b);
+    } else if (chosen == make_obs) {
+      SetBlockPorts(bid, 0, 0, 0, 0);
+    } else if (chosen == clear_wires) {
+      ClearBlockWires(bid);
+    } else if (chosen == del_blk) {
+      DeleteSelection();
+    }
+    return;
+  }
+
+  localroute::Id hit_cid = 0;
+  if (HitTestWire(event->pos(), &hit_cid)) {
+    selected_blocks_.clear();
+    highlighted_conns_.clear();
+    highlighted_conns_.insert(hit_cid);
+    has_selected_conn_ = true;
+    selected_conn_id_ = hit_cid;
+    emit SelectionChanged();
+    update();
+
+    QMenu menu(this);
+    QAction* del_wire = menu.addAction("删除连线 (Del)");
+    if (menu.exec(event->globalPos()) == del_wire) {
+      DeleteSelection();
+    }
+  }
+}
+
 void CanvasWidget::paintEvent(QPaintEvent* /*event*/) {
   QElapsedTimer paint_timer;
   paint_timer.start();
@@ -696,8 +1351,8 @@ void CanvasWidget::paintEvent(QPaintEvent* /*event*/) {
   QPainter painter(this);
   painter.fillRect(rect(), QColor(246, 248, 251));
 
-  const bool high_detail = zoom_ >= 0.4;
-  const bool mid_detail = zoom_ >= 0.15 && zoom_ < 0.4;
+  const bool high_detail = zoom_ >= 0.35;
+  const bool mid_detail = zoom_ >= 0.15 && zoom_ < 0.35;
   const bool low_detail = zoom_ < 0.15;
 
   painter.save();
@@ -815,9 +1470,12 @@ void CanvasWidget::paintEvent(QPaintEvent* /*event*/) {
 
   QPen block_pen(QColor(72, 86, 106), 1.2);
   block_pen.setCosmetic(true);
+  QPen obs_pen(QColor(180, 95, 40), 1.4);
+  obs_pen.setCosmetic(true);
   QPen sel_block_pen(QColor(0, 120, 215), 2.2);
   sel_block_pen.setCosmetic(true);
   const QBrush block_brush(QColor(255, 255, 255));
+  const QBrush obs_brush(QColor(255, 243, 232));
   const QBrush sel_block_brush(QColor(227, 241, 255));
   const QBrush low_block_brush(QColor(186, 200, 218));
   const QBrush pin_brush(QColor(46, 64, 87));
@@ -853,23 +1511,41 @@ void CanvasWidget::paintEvent(QPaintEvent* /*event*/) {
     for (localroute::Id id : vis_ids) {
       const auto& b = view.block(id);
       const bool selected = selected_blocks_.count(id) != 0;
+      const bool is_obstacle = b.pins.empty();
       const QRectF r(b.rect.l, b.rect.t, b.rect.r - b.rect.l,
                      b.rect.b - b.rect.t);
       if (mid_detail) {
-        painter.setPen(selected ? sel_block_pen : block_pen);
-        painter.setBrush(selected ? sel_block_brush : block_brush);
+        painter.setPen(selected ? sel_block_pen
+                                : (is_obstacle ? obs_pen : block_pen));
+        painter.setBrush(selected ? sel_block_brush
+                                  : (is_obstacle ? obs_brush : block_brush));
         painter.drawRect(r);
       } else {
-        painter.setPen(selected ? sel_block_pen : block_pen);
-        painter.setBrush(selected ? sel_block_brush : block_brush);
+        painter.setPen(selected ? sel_block_pen
+                                : (is_obstacle ? obs_pen : block_pen));
+        painter.setBrush(selected ? sel_block_brush
+                                  : (is_obstacle ? obs_brush : block_brush));
         painter.drawRoundedRect(r, 4.0, 4.0);
-        painter.setPen(QColor(38, 50, 66));
-        painter.drawText(r, Qt::AlignCenter, QString("B%1").arg(id));
-        painter.setPen(Qt::NoPen);
-        painter.setBrush(pin_brush);
+        painter.setPen(is_obstacle ? QColor(145, 70, 24) : QColor(38, 50, 66));
+        painter.drawText(
+            r, Qt::AlignCenter,
+            is_obstacle ? QString("Obs%1").arg(id) : QString("B%1").arg(id));
         for (const auto& p : b.pins) {
           const auto pt = PinPos(b, p.id);
-          painter.drawEllipse(QPointF(pt.x, pt.y), 2.8, 2.8);
+          const bool is_hot =
+              (hover_pin_.valid && hover_pin_.block_id == id &&
+               hover_pin_.pin_id == p.id) ||
+              (drag_kind_ == DragKind::kWiring && wire_src_.block_id == id &&
+               wire_src_.pin_id == p.id);
+          if (is_hot) {
+            painter.setPen(QPen(QColor(255, 255, 255), 1.5));
+            painter.setBrush(QColor(0, 168, 107));
+            painter.drawEllipse(QPointF(pt.x, pt.y), 5.2, 5.2);
+          } else {
+            painter.setPen(QPen(QColor(255, 255, 255), 1.0));
+            painter.setBrush(pin_brush);
+            painter.drawEllipse(QPointF(pt.x, pt.y), 3.2, 3.2);
+          }
         }
       }
     }
@@ -918,6 +1594,38 @@ void CanvasWidget::paintEvent(QPaintEvent* /*event*/) {
     painter.drawLines(hi_display_segs);
   }
   visible_conn_count_ = drawn_conns;
+
+  // Interactive wiring preview
+  if (drag_kind_ == DragKind::kWiring) {
+    QPen wire_pen(hover_pin_.valid ? QColor(0, 168, 107) : QColor(0, 120, 215),
+                  2.0, Qt::DashLine);
+    wire_pen.setCosmetic(true);
+    painter.setPen(wire_pen);
+    const QPointF mid(drag_current_world_.x(), drag_start_world_.y());
+    painter.drawLine(drag_start_world_, mid);
+    painter.drawLine(mid, drag_current_world_);
+  }
+
+  // Drag-and-drop ghost preview
+  if (has_drop_ghost_) {
+    const double gw = std::max(
+        drop_ghost_tmpl_.width,
+        std::max(drop_ghost_tmpl_.top_pins, drop_ghost_tmpl_.bottom_pins) *
+                24.0 +
+            20.0);
+    const double gh = std::max(
+        drop_ghost_tmpl_.height,
+        std::max(drop_ghost_tmpl_.left_pins, drop_ghost_tmpl_.right_pins) *
+                20.0 +
+            16.0);
+    const QRectF ghost(drop_ghost_world_.x() - gw * 0.5,
+                       drop_ghost_world_.y() - gh * 0.5, gw, gh);
+    QPen g_pen(QColor(0, 120, 215), 1.6, Qt::DashLine);
+    g_pen.setCosmetic(true);
+    painter.setPen(g_pen);
+    painter.setBrush(QColor(0, 120, 215, 40));
+    painter.drawRoundedRect(ghost, 4.0, 4.0);
+  }
 
   if (drag_kind_ == DragKind::kRubberBand) {
     const QRectF rb(std::min(drag_start_world_.x(), drag_current_world_.x()),
