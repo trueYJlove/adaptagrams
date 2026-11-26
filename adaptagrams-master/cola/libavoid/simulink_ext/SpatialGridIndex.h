@@ -78,14 +78,23 @@ template <class Item> class SpatialGrid {
             for (auto &e : boxes)
                 if (e.second.intersects(a))
                     ids.push_back(e.first);
-        } else
-            visit(g, [&](Key k) {
-                auto it = cells.find(k);
-                if (it != cells.end())
-                    for (Item id : it->second)
-                        if (boxes.at(id).intersects(a))
-                            ids.push_back(id);
-            });
+        } else {
+            for (int y = g.t; y <= g.b; ++y) {
+                bool yEdge = (y == g.t || y == g.b);
+                for (int x = g.l; x <= g.r; ++x) {
+                    auto it = cells.find((Key(std::uint32_t(x)) << 32) | std::uint32_t(y));
+                    if (it == cells.end())
+                        continue;
+                    if (yEdge || x == g.l || x == g.r) {
+                        for (Item id : it->second)
+                            if (boxes.at(id).intersects(a))
+                                ids.push_back(id);
+                    } else {
+                        ids.insert(ids.end(), it->second.begin(), it->second.end());
+                    }
+                }
+            }
+        }
         // ponytail: scan exceptionally long segments; add a secondary index only if measured hot.
         for (auto &e : overflow)
             if (e.second.intersects(a))

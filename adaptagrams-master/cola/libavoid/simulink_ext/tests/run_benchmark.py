@@ -51,7 +51,7 @@ def main():
     p.add_argument('output', type=Path)
     p.add_argument('--rounds', type=int, default=1, choices=range(1, 11))
     p.add_argument('--scales', type=int, nargs='+', default=[1000, 3000, 5000, 10000])
-    p.add_argument('--modes', nargs='+', choices=['default', 'tuned', 'local1', 'local4', 'async', 'legacy4', 'profile4'],
+    p.add_argument('--modes', nargs='+', choices=['default', 'tuned', 'local1', 'local4', 'async', 'legacy4', 'profile4', 'libavoid4', 'libavoid_profile4'],
                    default=['default', 'tuned', 'local1', 'local4'])
     a = p.parse_args()
     out = a.output.resolve()

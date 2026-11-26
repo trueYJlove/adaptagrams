@@ -1,7 +1,8 @@
 #include "AsyncLocalRouter.h"
-#include <chrono>
-#include <future>
 #include "libavoid/scanline.h"
+#include <chrono>
+#include <cmath>
+#include <future>
 #include <iostream>
 #include <random>
 using namespace localroute;
@@ -17,14 +18,15 @@ void pair(LocalOrthogonalRouter &r) {
     r.addConnector({1, 1, 1, 2, 2});
 }
 struct Spy : ILocalRouteSolver {
-    std::shared_ptr<const ILocalRouteSolver> native = libavoidSolver();
+    std::shared_ptr<const ILocalRouteSolver> inner;
     mutable std::vector<Id> seen;
     mutable bool nudge = false;
+    explicit Spy(std::shared_ptr<const ILocalRouteSolver> s = lazyHananAStarSolver()) : inner(std::move(s)) {}
     const char *name() const override { return "spy"; }
     std::vector<Point> solve(const Request &r) const override {
         seen.push_back(r.conn.id);
         nudge = r.nudge;
-        return native->solve(r);
+        return inner->solve(r);
     }
 };
 void grid() {
@@ -57,23 +59,29 @@ void grid() {
         CHECK(g.query(q) == want);
     }
 }
-void dirty() {
-    auto s = std::make_shared<Spy>();
+void dirtyFor(const std::shared_ptr<const ILocalRouteSolver> &solver) {
+    auto s = std::make_shared<Spy>(solver);
     Config cfg;
+    CHECK(!cfg.rerouteThirdPartyBlocked);
     cfg.settleNudge = true;
     cfg.fastPaths = false;
     LocalOrthogonalRouter r(cfg, s);
-    pair(r);
+    pair(r); // route 1: (40,20) -> (200,20)
     r.addBlock(block(3, {100, 80, 140, 120}));
     r.addBlock(block(4, {300, 80, 340, 120}));
     r.addConnector({2, 3, 1, 4, 2});
     r.routeAllParallel(1);
-    auto old = r.route(1).points;
+    auto old1 = r.route(1).points;
+    CHECK(r.route(1).status == Status::Valid && old1.size() >= 2);
     s->seen.clear();
-    r.moveBlock(3, 0, 5);
+    // Move block 3 directly over the middle of connector 1 (A-B).
+    // With rerouteThirdPartyBlocked == false, connector 1 must NOT become Pending or be rerouted.
+    r.moveBlocksBatch({{3, {100, 5, 140, 45}}});
+    CHECK(r.route(1).status == Status::Valid);
+    CHECK(r.route(2).status == Status::Pending);
     CHECK(r.rerouteAffected({3, 3}) == std::vector<Id>{2});
     CHECK(s->seen == std::vector<Id>{2});
-    CHECK(r.route(1).points == old);
+    CHECK(r.route(1).points == old1);
     s->seen.clear();
     r.rerouteAffected({3}, true);
     CHECK(s->nudge && s->seen == std::vector<Id>{2});
@@ -81,8 +89,14 @@ void dirty() {
     r.moveBlock(4, 0, 5);
     CHECK(r.rerouteAffected({4}).empty());
 }
-void avoid() {
-    LocalOrthogonalRouter r;
+void dirty() {
+    dirtyFor(lazyHananAStarSolver());
+    dirtyFor(libavoidSolver());
+}
+void avoidFor(const std::shared_ptr<const ILocalRouteSolver> &solver) {
+    Config cfg;
+    cfg.fastPaths = false;
+    LocalOrthogonalRouter r(cfg, solver);
     pair(r);
     r.addBlock(block(3, {100, -10, 140, 50}));
     r.addBlock(block(4, {220, 120, 260, 160}));
@@ -100,6 +114,10 @@ void avoid() {
             CHECK(!(s.l < 148 && s.r > 92 && s.t < 58 && s.b > -18));
         }
     }
+}
+void avoid() {
+    avoidFor(lazyHananAStarSolver());
+    avoidFor(libavoidSolver());
 }
 struct Wall : ILocalRouteSolver {
     const char *name() const override { return "wall-test"; }
@@ -134,8 +152,8 @@ void expansion() {
     limited.routeAllParallel(1);
     CHECK(limited.route(1).status == Status::DisplayOnly);
 }
-void overlap() {
-    LocalOrthogonalRouter r;
+void overlapFor(const std::shared_ptr<const ILocalRouteSolver> &solver) {
+    LocalOrthogonalRouter r({}, solver);
     pair(r);
     r.moveBlocksBatch({{2, {0, 0, 40, 40}}});
     r.routeAllParallel(1);
@@ -148,15 +166,12 @@ void overlap() {
     r.routeAllParallel(1);
     CHECK(r.route(1).status == Status::DisplayOnly && r.route(1).calls == 0);
 }
-void parallel() {
-    Avoid::Node a(static_cast<Avoid::ShiftSegment *>(nullptr), 5, 0);
-    Avoid::Node b(static_cast<Avoid::ShiftSegment *>(nullptr), 5, 1);
-    Avoid::Event x(Avoid::Open, &a, 1), y(Avoid::Open, &b, 1);
-    Avoid::Event *xp = &x, *yp = &y;
-    CHECK(Avoid::compare_events(&xp, &xp) == 0);
-    CHECK(Avoid::compare_events(&xp, &yp) < 0 && Avoid::compare_events(&yp, &xp) > 0);
-    CHECK(Avoid::CmpNodePos{}(&a, &b) && !Avoid::CmpNodePos{}(&b, &a));
-    LocalOrthogonalRouter r;
+void overlap() {
+    overlapFor(lazyHananAStarSolver());
+    overlapFor(libavoidSolver());
+}
+void parallelFor(const std::shared_ptr<const ILocalRouteSolver> &solver) {
+    LocalOrthogonalRouter r({}, solver);
     for (Id i = 0; i < 500; ++i) {
         double x = i % 25 * 160., y = i / 25 * 90.;
         r.addBlock(block(i, {x, y, x + 70, y + 40}));
@@ -179,9 +194,22 @@ void parallel() {
             }
     }
 }
-void fastAndObstruction() {
-    auto s = std::make_shared<Spy>();
-    LocalOrthogonalRouter r({}, s);
+void parallel() {
+    Avoid::Node a(static_cast<Avoid::ShiftSegment *>(nullptr), 5, 0);
+    Avoid::Node b(static_cast<Avoid::ShiftSegment *>(nullptr), 5, 1);
+    Avoid::Event x(Avoid::Open, &a, 1), y(Avoid::Open, &b, 1);
+    Avoid::Event *xp = &x, *yp = &y;
+    CHECK(Avoid::compare_events(&xp, &xp) == 0);
+    CHECK(Avoid::compare_events(&xp, &yp) < 0 && Avoid::compare_events(&yp, &xp) > 0);
+    CHECK(Avoid::CmpNodePos{}(&a, &b) && !Avoid::CmpNodePos{}(&b, &a));
+    parallelFor(lazyHananAStarSolver());
+    parallelFor(libavoidSolver());
+}
+void fastAndObstructionFor(const std::shared_ptr<const ILocalRouteSolver> &solver) {
+    auto s = std::make_shared<Spy>(solver);
+    Config cfg;
+    cfg.rerouteThirdPartyBlocked = true;
+    LocalOrthogonalRouter r(cfg, s);
     pair(r);
     r.addBlock(block(3, {100, 80, 140, 120}));
     r.routeAllParallel(1);
@@ -202,24 +230,30 @@ void fastAndObstruction() {
     r.removeConnector(1);
     CHECK(r.rerouteAffected({3}).empty());
 }
+void fastAndObstruction() {
+    fastAndObstructionFor(lazyHananAStarSolver());
+    fastAndObstructionFor(libavoidSolver());
+}
 struct PausedSolver : ILocalRouteSolver {
+    std::shared_ptr<const ILocalRouteSolver> inner;
     mutable std::promise<void> entered;
     std::shared_future<void> release;
     mutable unsigned calls = 0;
-    explicit PausedSolver(std::shared_future<void> release) : release(std::move(release)) {}
+    PausedSolver(std::shared_future<void> release, std::shared_ptr<const ILocalRouteSolver> s)
+        : inner(std::move(s)), release(std::move(release)) {}
     const char *name() const override { return "paused"; }
     std::vector<Point> solve(const Request &q) const override {
         if (++calls == 1) {
             entered.set_value();
             release.wait();
         }
-        return libavoidSolver()->solve(q);
+        return inner->solve(q);
     }
 };
-void asyncRouting() {
+void asyncRoutingFor(const std::shared_ptr<const ILocalRouteSolver> &solver) {
     using namespace std::chrono_literals;
     std::promise<void> release;
-    auto s = std::make_shared<PausedSolver>(release.get_future().share());
+    auto s = std::make_shared<PausedSolver>(release.get_future().share(), solver);
     auto entered = s->entered.get_future();
     Config cfg;
     cfg.fastPaths = false;
@@ -245,6 +279,73 @@ void asyncRouting() {
     auto &out = router.view().route(1);
     CHECK(router.pendingCount() == 0 && out.status == Status::Valid && (out.points.front() == Point{40, 36}));
 }
+void asyncRouting() {
+    asyncRoutingFor(lazyHananAStarSolver());
+    asyncRoutingFor(libavoidSolver());
+}
+void boundaryCases() {
+    Config cfg;
+    cfg.fastPaths = false;
+    cfg.buffer = 8;
+
+    // 1. Tight corridor border-hugging detour & wide corridor channel centering
+    {
+        LocalOrthogonalRouter r(cfg, lazyHananAStarSolver());
+        r.addBlock(block(1, {0, 0, 40, 40}));
+        r.addBlock(block(2, {200, 0, 240, 40}));
+        // Top and bottom walls leaving a narrow corridor above/below, plus a blocking wall in front.
+        r.addBlock(block(3, {80, -20, 120, 60}));
+        r.addBlock(block(4, {60, -100, 140, -36})); // padded bottom = -28, wall 3 padded top = -28 => tight touch at y=-28!
+        r.addConnector({1, 1, 1, 2, 2});
+
+        // Wide channel centering pair (forced through horizontal corridor [268, 312] -> midline y=290)
+        r.addBlock(block(10, {0, 200, 40, 240}));
+        r.addBlock(block(11, {240, 320, 280, 360}));
+        r.addBlock(block(12, {90, 120, 220, 260}));
+        r.addBlock(block(13, {0, 320, 180, 380}));
+        r.addConnector({2, 10, 1, 11, 2});
+
+        r.routeAllParallel(1);
+        CHECK(r.route(1).status == Status::Valid);
+        CHECK(r.route(2).status == Status::Valid);
+        bool passedCorridorCenter = false;
+        for (const auto &pt : r.route(2).points)
+            if (std::abs(pt.y - 290.0) < 1.0)
+                passedCorridorCenter = true;
+        CHECK(passedCorridorCenter);
+    }
+
+    // 2. Multi-line fan-out sharing the same pin
+    {
+        LocalOrthogonalRouter r(cfg, lazyHananAStarSolver());
+        r.addBlock({1, {0, 100, 40, 140}, {{1, 1, .5, Right}}});
+        for (Id i = 0; i < 4; ++i) {
+            double y = 20.0 + i * 70.0;
+            r.addBlock(block(10 + i, {220, y, 260, y + 40}));
+            r.addConnector({100 + i, 1, 1, 10 + i, 2});
+        }
+        r.addBlock(block(50, {110, 80, 150, 160}));
+        r.routeAllParallel(1);
+        for (Id i = 0; i < 4; ++i)
+            CHECK(r.route(100 + i).status == Status::Valid);
+    }
+
+    // 3. Half-enclosed U-shaped pocket around start and end
+    {
+        LocalOrthogonalRouter r(cfg, lazyHananAStarSolver());
+        r.addBlock(block(1, {0, 0, 40, 40}));
+        r.addBlock(block(2, {260, 0, 300, 40}));
+        // U-shape around block 1 blocking Right, Up; only Down escape is open.
+        r.addBlock(block(3, {70, -60, 100, 60}));
+        r.addBlock(block(4, {-20, -60, 65, -25}));
+        // U-shape around block 2 blocking Left, Down; only Up escape is open.
+        r.addBlock(block(5, {200, -10, 230, 100}));
+        r.addBlock(block(6, {235, 65, 320, 100}));
+        r.addConnector({1, 1, 1, 2, 2});
+        r.routeAllParallel(1);
+        CHECK(r.route(1).status == Status::Valid);
+    }
+}
 int main(int argc, char **argv) {
     const std::pair<std::string, void (*)()> cases[] = {{"SpatialGridBasic", grid},
                                                         {"DirtyOnlyNoRerouteOnOverlap", dirty},
@@ -253,7 +354,8 @@ int main(int argc, char **argv) {
                                                         {"OverlappingBlocksFallback", overlap},
                                                         {"ParallelColdStartDeterminism", parallel},
                                                         {"FastReuseAndThirdPartyObstruction", fastAndObstruction},
-                                                        {"AsyncDiscardsStaleResults", asyncRouting}};
+                                                        {"AsyncDiscardsStaleResults", asyncRouting},
+                                                        {"LazyHananAStarBoundaryCases", boundaryCases}};
     try {
         for (auto &t : cases)
             if (argc == 1 || t.first == argv[1]) {

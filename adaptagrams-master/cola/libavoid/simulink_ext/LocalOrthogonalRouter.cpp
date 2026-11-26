@@ -61,7 +61,7 @@ bool finitePoint(Point p) {
 }
 } // namespace
 LocalOrthogonalRouter::LocalOrthogonalRouter(Config c, std::shared_ptr<const ILocalRouteSolver> s)
-    : cfg(c), index(c.cell), solver(s ? s : libavoidSolver()), segments(c.cell) {
+    : cfg(c), index(c.cell), solver(s ? s : lazyHananAStarSolver()), segments(c.cell) {
     if (!(c.cell >= 1 && c.padding > 0 && c.padding <= 1e5 && c.buffer >= 0 && c.buffer <= 1e4 &&
           c.penalty > 0 && std::isfinite(c.penalty) && c.nudgeDistance > 0 &&
           std::isfinite(c.nudgeDistance) && c.budget >= 2 && c.retries <= 8))
@@ -78,7 +78,8 @@ void LocalOrthogonalRouter::addBlock(Block b) {
     Id id = b.id;
     auto rect = b.rect;
     blocks.emplace(id, std::move(b));
-    invalidateObstacle(id, rect);
+    if (cfg.rerouteThirdPartyBlocked)
+        invalidateObstacle(id, rect);
 }
 void LocalOrthogonalRouter::addConnector(Conn c) {
     pin(blocks.at(c.src), c.sp);
@@ -127,7 +128,8 @@ void LocalOrthogonalRouter::moveBlocksBatch(const std::vector<std::pair<Id, Rect
         if (it != adjacent.end())
             for (Id id : it->second)
                 mark(id);
-        invalidateObstacle(m.first, blocks.at(m.first).rect);
+        if (cfg.rerouteThirdPartyBlocked)
+            invalidateObstacle(m.first, blocks.at(m.first).rect);
     }
 }
 void LocalOrthogonalRouter::moveBlock(Id id, double x, double y) {
@@ -157,16 +159,20 @@ void LocalOrthogonalRouter::invalidateObstacle(Id blockId, Rect rect) {
     }
 }
 void LocalOrthogonalRouter::clearSegments(Id id) {
+    if (!cfg.rerouteThirdPartyBlocked)
+        return;
     auto it = routes.find(id);
     if (it != routes.end() && it->second.method != RouteMethod::None)
         for (size_t j = 1; j < it->second.points.size(); ++j)
             segments.remove((std::uint64_t(id) << 32) | j);
 }
 void LocalOrthogonalRouter::publish(Id id, Route route) {
-    clearSegments(id);
-    if (route.status == Status::Valid)
-        for (size_t j = 1; j < route.points.size(); ++j)
-            segments.insert((std::uint64_t(id) << 32) | j, box(route.points[j - 1], route.points[j]), true);
+    if (cfg.rerouteThirdPartyBlocked) {
+        clearSegments(id);
+        if (route.status == Status::Valid)
+            for (size_t j = 1; j < route.points.size(); ++j)
+                segments.insert((std::uint64_t(id) << 32) | j, box(route.points[j - 1], route.points[j]), true);
+    }
     routes[id] = std::move(route);
     dirty.erase(id);
 }

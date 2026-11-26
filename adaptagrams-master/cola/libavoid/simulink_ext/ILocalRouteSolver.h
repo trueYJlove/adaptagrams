@@ -36,7 +36,7 @@ struct Conn {
 struct Config {
     double cell = 256, padding = 250, buffer = 8, penalty = 50, nudgeDistance = 6;
     unsigned retries = 3, budget = 120;
-    bool settleNudge = false, fastPaths = true, profile = false;
+    bool settleNudge = false, fastPaths = true, profile = false, rerouteThirdPartyBlocked = false;
 };
 enum class Status { Valid, DisplayOnly, Failed, Pending };
 enum class Outcome { None, CoincidentPins, BuriedPin, InvalidCandidate, Collision, ObstacleBudget };
@@ -67,4 +67,5 @@ struct ILocalRouteSolver {
     virtual std::vector<Point> solve(const Request &) const = 0;
 };
 std::shared_ptr<const ILocalRouteSolver> libavoidSolver();
+std::shared_ptr<const ILocalRouteSolver> lazyHananAStarSolver();
 } // namespace localroute

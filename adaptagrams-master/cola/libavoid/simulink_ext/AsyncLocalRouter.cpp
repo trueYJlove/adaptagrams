@@ -58,8 +58,9 @@ void AsyncLocalRouter::prioritize(Rect viewport, const std::vector<Id> &selectio
         if (it != model.adjacent.end())
             ids.insert(it->second.begin(), it->second.end());
     }
-    for (auto key : model.segments.query(viewport))
-        ids.insert(Id(key >> 32));
+    if (model.cfg.rerouteThirdPartyBlocked)
+        for (auto key : model.segments.query(viewport))
+            ids.insert(Id(key >> 32));
     std::lock_guard<std::mutex> lock(mutex);
     if (ids != priority) {
         priority = std::move(ids);

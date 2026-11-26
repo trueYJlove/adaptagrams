@@ -165,14 +165,16 @@ int main(int argc, char **argv) {
         asyncBench(top, n);
         return 0;
     }
-    if (mode != "local1" && mode != "local4" && mode != "profile4" && mode != "legacy4")
+    if (mode != "local1" && mode != "local4" && mode != "profile4" && mode != "legacy4" &&
+        mode != "libavoid4" && mode != "libavoid_profile4")
         return 2;
     unsigned threads = mode == "local1" ? 1 : 4;
     auto start = Clock::now();
     Config cfg;
-    cfg.profile = mode == "profile4" || mode == "legacy4";
+    cfg.profile = mode == "profile4" || mode == "legacy4" || mode == "libavoid_profile4";
     cfg.fastPaths = mode != "legacy4";
-    LocalOrthogonalRouter r(cfg);
+    auto solver = (mode == "libavoid4" || mode == "libavoid_profile4") ? libavoidSolver() : lazyHananAStarSolver();
+    LocalOrthogonalRouter r(cfg, solver);
     std::vector<std::vector<Id>> adj(n);
     for (auto b : top.blocks)
         r.addBlock(b);
@@ -204,7 +206,7 @@ int main(int argc, char **argv) {
                 << p.cappedAttempts << '\n';
         }
     }
-    if (mode == "legacy4" || mode == "profile4")
+    if (mode == "legacy4" || mode == "profile4" || mode == "libavoid_profile4")
         return 0;
     auto mid = r.block(n / 2).rect;
     std::vector<double> dFrames;
@@ -273,6 +275,8 @@ int main(int argc, char **argv) {
             if (scene == "C" && n == 10000 && i + 1 == frames && argc > 3) {
                 auto v = initial.front().pad(310);
                 r.exportRegionToSVG(std::string(argv[3]) + "/drag_after.svg", v, changed);
+                if (std::string(r.solverName()) == "LazyHananAStarSolver")
+                    r.exportRegionToSVG(std::string(argv[3]) + "/drag_after_lazy_astar.svg", v, changed);
             }
         }
         std::vector<std::pair<Id, Rect>> restore;
@@ -294,13 +298,13 @@ int main(int argc, char **argv) {
                          adj.begin());
             if (n == 10000 && argc > 3)
                 r.exportRegionToSVG(std::string(argv[3]) + "/drag_before.svg", r.block(id).rect.pad(310));
-            run(scene, {id}, 50, times, stats, extra);
+            run(scene, {id}, 200, times, stats, extra);
         } else {
             unsigned count = scene == "B20" ? 20 : 50;
             std::vector<Id> ids;
             for (Id i = 0; i < count; ++i)
                 ids.push_back((i / 10) * top.side + i % 10);
-            run(scene, ids, 50, times, stats, extra);
+            run(scene, ids, 200, times, stats, extra);
         }
         std::vector<const Route *> refs;
         for (auto &q : stats)
