@@ -1,0 +1,16 @@
+.venv/
+.venv*/
+build-*/
+out-*/
+benchmark-*-new/
+*.exe
+*.obj
+*.o
+*.pdb
+*.ilk
+*.lib
+*.a
+__pycache__/
+.DS_Store
+.vscode/
+.idea/
