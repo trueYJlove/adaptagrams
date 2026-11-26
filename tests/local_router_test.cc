@@ -452,11 +452,16 @@ void TestChannelNudgingCascadeAndNoHook() {
   r.RouteAllParallel(1);
   CHECK(r.route(1).status == Status::kValid);
   CHECK(r.route(1).points.size() >= 6);  // Wrapped around from right side.
+  const std::vector<Point> frozen_b3_initial = r.route(2).points;
+  const std::vector<Point> frozen_b8_initial = r.route(3).points;
 
   // Drag B9 left into the source column: Simple Z must eliminate the stale
-  // hook (<= 4 points) and ChannelNudger must separate B9, B3, B8 cleanly.
+  // hook (<= 4 points) and ChannelNudger must separate B9 without moving
+  // non-adjacent routes B3/B8.
   r.MoveBlock(9, -300.0, 0.0);
-  (void)r.RerouteAffected({9});
+  CHECK(r.RerouteAffected({9}) == std::vector<Id>{1});
+  CHECK(r.route(2).points == frozen_b3_initial);
+  CHECK(r.route(3).points == frozen_b8_initial);
 
   for (Id cid : {1u, 2u, 3u, 4u}) {
     const Route& rt = r.route(cid);
@@ -484,6 +489,34 @@ void TestChannelNudgingCascadeAndNoHook() {
       for (std::size_t sa = 1; sa < pa.size(); ++sa) {
         for (std::size_t sb = 1; sb < pb.size(); ++sb) {
           CHECK(!SegmentsProperlyCross(pa[sa - 1], pa[sa], pb[sb - 1], pb[sb]));
+        }
+      }
+    }
+  }
+
+  // Drag B3 continuously rightward near/across B9->B10's vertical segment:
+  // B9->B10 and B8->B11 must remain bit-for-bit stationary while B3->B10
+  // keeps >= 4px separation from overlapping vertical segments.
+  const std::vector<Point> frozen_b9 = r.route(1).points;
+  const std::vector<Point> frozen_b8 = r.route(3).points;
+  const double b9_mid_x = frozen_b9[1].x;
+  const double b9_min_y = std::min(frozen_b9[1].y, frozen_b9[2].y);
+  const double b9_max_y = std::max(frozen_b9[1].y, frozen_b9[2].y);
+  for (int step = 0; step < 12; ++step) {
+    r.MoveBlock(3, 10.0, 0.0);
+    CHECK(r.RerouteAffected({3}) == std::vector<Id>{2});
+    CHECK(r.route(1).points == frozen_b9);
+    CHECK(r.route(3).points == frozen_b8);
+    const Route& b3_rt = r.route(2);
+    CHECK(b3_rt.status == Status::kValid);
+    for (std::size_t j = 1; j < b3_rt.points.size(); ++j) {
+      const Point u = b3_rt.points[j - 1];
+      const Point v = b3_rt.points[j];
+      if (std::abs(u.x - v.x) <= 1e-6) {
+        const double ymin = std::min(u.y, v.y);
+        const double ymax = std::max(u.y, v.y);
+        if (ymin < b9_max_y - 1e-3 && b9_min_y < ymax - 1e-3) {
+          CHECK(std::abs(u.x - b9_mid_x) >= 4.0);
         }
       }
     }

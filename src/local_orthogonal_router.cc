@@ -223,8 +223,8 @@ void LocalOrthogonalRouter::set_enable_channel_nudging(bool enabled) {
 }
 
 std::vector<Id> LocalOrthogonalRouter::ApplyChannelNudging(
-    const std::vector<Id>& seed_conns, bool full_graph) {
-  return ChannelNudger::Nudge(this, seed_conns, full_graph);
+    const std::vector<Id>& mutable_conns, bool full_graph) {
+  return ChannelNudger::Nudge(this, mutable_conns, full_graph);
 }
 
 bool LocalOrthogonalRouter::ValidateAndSimplifyRoute(
@@ -582,9 +582,7 @@ std::vector<Id> LocalOrthogonalRouter::RerouteAffected(
     Publish(id, SolveOne(conns_.at(id), settled));
   }
   if (cfg_.enable_channel_nudging && !ids.empty()) {
-    const std::vector<Id> nudged =
-        ApplyChannelNudging({ids.begin(), ids.end()}, false);
-    ids.insert(nudged.begin(), nudged.end());
+    (void)ApplyChannelNudging({ids.begin(), ids.end()}, false);
   }
   return {ids.begin(), ids.end()};
 }

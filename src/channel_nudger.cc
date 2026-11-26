@@ -8,6 +8,7 @@
 #include <set>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -38,6 +39,7 @@ struct MiddleSegment {
   Id conn_id = 0;
   std::size_t seg_idx = 0;
   NetKey net;
+  bool is_mutable = true;
   double coord = 0.0;
   double min_k = 0.0;
   double max_k = 0.0;
@@ -50,8 +52,22 @@ struct MiddleSegment {
 struct TrackGroup {
   NetKey net;
   std::vector<const MiddleSegment*> segs;
+  double min_k = 0.0;
+  double max_k = 0.0;
+  double coord0 = 0.0;
   int shape_class = 0;
   double order_key = 0.0;
+};
+
+struct TrackAnchor {
+  NetKey net;
+  double coord = 0.0;
+  double min_k = 0.0;
+  double max_k = 0.0;
+  double prev_prim = 0.0;
+  double next_prim = 0.0;
+  double k_at_seg = 0.0;
+  double k_at_next = 0.0;
 };
 
 double PrimaryCoord(Point p, Axis axis) {
@@ -81,19 +97,65 @@ Rect RouteBounds(const std::vector<Point>& pts) {
   return b;
 }
 
+bool IntervalsOverlap(double min_a, double max_a, double min_b, double max_b) {
+  return min_a < max_b - 1e-3 && min_b < max_a - 1e-3;
+}
+
+bool CrossesOrthoPrimVert(double h_prim0, double h_prim1, double h_k,
+                          double v_prim, double v_k0, double v_k1) {
+  const double hp_min = std::min(h_prim0, h_prim1);
+  const double hp_max = std::max(h_prim0, h_prim1);
+  const double vk_min = std::min(v_k0, v_k1);
+  const double vk_max = std::max(v_k0, v_k1);
+  return v_prim > hp_min + 1e-6 && v_prim < hp_max - 1e-6 &&
+         h_k > vk_min + 1e-6 && h_k < vk_max - 1e-6;
+}
+
+int CountGroupCrossings(const TrackGroup& group, double cand_coord,
+                        const std::vector<TrackAnchor>& anchors) {
+  int crossings = 0;
+  for (const MiddleSegment* s : group.segs) {
+    for (const TrackAnchor& a : anchors) {
+      if (a.net == group.net) {
+        continue;
+      }
+      if (CrossesOrthoPrimVert(s->prev_prim, cand_coord, s->k_at_seg, a.coord,
+                               a.k_at_seg, a.k_at_next)) {
+        ++crossings;
+      }
+      if (CrossesOrthoPrimVert(cand_coord, s->next_prim, s->k_at_next, a.coord,
+                               a.k_at_seg, a.k_at_next)) {
+        ++crossings;
+      }
+      if (CrossesOrthoPrimVert(a.prev_prim, a.coord, a.k_at_seg, cand_coord,
+                               s->k_at_seg, s->k_at_next)) {
+        ++crossings;
+      }
+      if (CrossesOrthoPrimVert(a.coord, a.next_prim, a.k_at_next, cand_coord,
+                               s->k_at_seg, s->k_at_next)) {
+        ++crossings;
+      }
+    }
+  }
+  return crossings;
+}
+
 std::vector<Id> CollectParticipants(
     const Config& cfg, const SpatialGridIndex& index,
     const std::unordered_map<Id, Conn>& conns,
     const std::unordered_map<Id, std::vector<Id>>& adjacent,
     const std::unordered_map<Id, Route>& routes,
-    const std::vector<Id>& seed_conns, bool full_graph) {
+    const std::vector<Id>& mutable_conns, bool full_graph,
+    std::unordered_set<Id>* mutable_set_out) {
   std::set<Id> selected;
+  mutable_set_out->clear();
   if (full_graph) {
     for (const auto& kv : conns) {
       const auto rit = routes.find(kv.first);
       if (rit != routes.end() && rit->second.status == Status::kValid &&
           rit->second.points.size() >= 4) {
         selected.insert(kv.first);
+        mutable_set_out->insert(kv.first);
       }
     }
     return {selected.begin(), selected.end()};
@@ -101,13 +163,14 @@ std::vector<Id> CollectParticipants(
 
   bool has_box = false;
   Rect union_box{0, 0, 0, 0};
-  for (Id cid : seed_conns) {
+  for (Id cid : mutable_conns) {
     const auto rit = routes.find(cid);
     if (rit == routes.end() || rit->second.status != Status::kValid ||
         rit->second.points.size() < 4) {
       continue;
     }
     selected.insert(cid);
+    mutable_set_out->insert(cid);
     const Rect rb = RouteBounds(rit->second.points);
     if (!has_box) {
       union_box = rb;
@@ -123,10 +186,11 @@ std::vector<Id> CollectParticipants(
     return {};
   }
 
+  const std::size_t cap = std::max(kMaxLocalConns, selected.size());
   const double pad = std::max(cfg.nudge_distance * 2.0, 80.0);
   const std::vector<Id> nearby_blocks = index.Query(union_box.Pad(pad));
   for (Id bid : nearby_blocks) {
-    if (selected.size() >= kMaxLocalConns) {
+    if (selected.size() >= cap) {
       break;
     }
     const auto ait = adjacent.find(bid);
@@ -134,7 +198,7 @@ std::vector<Id> CollectParticipants(
       continue;
     }
     for (Id cid : ait->second) {
-      if (selected.size() >= kMaxLocalConns) {
+      if (selected.size() >= cap) {
         break;
       }
       const auto rit = routes.find(cid);
@@ -149,6 +213,7 @@ std::vector<Id> CollectParticipants(
 
 std::vector<MiddleSegment> ExtractMiddleSegments(
     const std::vector<Id>& participants,
+    const std::unordered_set<Id>& mutable_set,
     const std::unordered_map<Id, Conn>& conns,
     const std::unordered_map<Id, Route>& routes, Axis axis) {
   std::vector<MiddleSegment> segments;
@@ -161,6 +226,7 @@ std::vector<MiddleSegment> ExtractMiddleSegments(
     const auto& pts = rit->second.points;
     const Conn& conn = conns.at(cid);
     const NetKey net{conn.src, conn.sp};
+    const bool is_mut = mutable_set.count(cid) != 0;
     for (std::size_t j = 1; j + 2 < pts.size(); ++j) {
       const double p0_prim = PrimaryCoord(pts[j], axis);
       const double p1_prim = PrimaryCoord(pts[j + 1], axis);
@@ -171,6 +237,7 @@ std::vector<MiddleSegment> ExtractMiddleSegments(
         seg.conn_id = cid;
         seg.seg_idx = j;
         seg.net = net;
+        seg.is_mutable = is_mut;
         seg.coord = 0.5 * (p0_prim + p1_prim);
         seg.min_k = std::min(p0_k, p1_k);
         seg.max_k = std::max(p0_k, p1_k);
@@ -185,16 +252,25 @@ std::vector<MiddleSegment> ExtractMiddleSegments(
   return segments;
 }
 
-void ComputeOrderKey(TrackGroup* group) {
+void ComputeGroupStats(TrackGroup* group) {
   const MiddleSegment* rep = group->segs.front();
   double best_span = rep->max_k - rep->min_k;
+  double min_k = rep->min_k;
+  double max_k = rep->max_k;
+  double coord_sum = 0.0;
   for (const MiddleSegment* s : group->segs) {
+    min_k = std::min(min_k, s->min_k);
+    max_k = std::max(max_k, s->max_k);
+    coord_sum += s->coord;
     const double span = s->max_k - s->min_k;
     if (span > best_span + 1e-6) {
       best_span = span;
       rep = s;
     }
   }
+  group->min_k = min_k;
+  group->max_k = max_k;
+  group->coord0 = coord_sum / static_cast<double>(group->segs.size());
   const bool in_neg = rep->prev_prim < rep->coord;
   const bool out_pos = rep->next_prim > rep->coord;
   const double a = rep->k_at_seg;
@@ -214,19 +290,175 @@ void ComputeOrderKey(TrackGroup* group) {
   }
 }
 
+void ComputeGroupFreeBounds(const Config& cfg, const SpatialGridIndex& index,
+                            const std::unordered_map<Id, Block>& blocks,
+                            Axis axis, const TrackGroup& group,
+                            double search_span, double* free_min_out,
+                            double* free_max_out) {
+  double free_min = group.coord0 - search_span;
+  double free_max = group.coord0 + search_span;
+  const Rect query_box = (axis == Axis::kVertical)
+                             ? Rect{group.coord0 - search_span - cfg.buffer,
+                                    group.min_k - cfg.buffer,
+                                    group.coord0 + search_span + cfg.buffer,
+                                    group.max_k + cfg.buffer}
+                             : Rect{group.min_k - cfg.buffer,
+                                    group.coord0 - search_span - cfg.buffer,
+                                    group.max_k + cfg.buffer,
+                                    group.coord0 + search_span + cfg.buffer};
+
+  for (Id bid : index.Query(query_box)) {
+    const Rect rb = blocks.at(bid).rect.Pad(cfg.buffer);
+    const double b_min_k = (axis == Axis::kVertical) ? rb.t : rb.l;
+    const double b_max_k = (axis == Axis::kVertical) ? rb.b : rb.r;
+    if (b_max_k <= group.min_k + 1e-4 || b_min_k >= group.max_k - 1e-4) {
+      continue;
+    }
+    const double b_min_p = (axis == Axis::kVertical) ? rb.l : rb.t;
+    const double b_max_p = (axis == Axis::kVertical) ? rb.r : rb.b;
+    if (b_max_p <= group.coord0 + 1e-3) {
+      free_min = std::max(free_min, b_max_p + 0.05);
+    } else if (b_min_p >= group.coord0 - 1e-3) {
+      free_max = std::min(free_max, b_min_p - 0.05);
+    }
+  }
+
+  for (const MiddleSegment* s : group.segs) {
+    if (s->prev_prim < s->coord - 1e-3) {
+      free_min = std::max(free_min, s->prev_prim + 1.0);
+    } else if (s->prev_prim > s->coord + 1e-3) {
+      free_max = std::min(free_max, s->prev_prim - 1.0);
+    }
+    if (s->next_prim < s->coord - 1e-3) {
+      free_min = std::max(free_min, s->next_prim + 1.0);
+    } else if (s->next_prim > s->coord + 1e-3) {
+      free_max = std::min(free_max, s->next_prim - 1.0);
+    }
+  }
+
+  *free_min_out = free_min;
+  *free_max_out = free_max;
+}
+
+double PickNearestFreeTrack(const Config& cfg, const TrackGroup& group,
+                            double free_min, double free_max,
+                            const std::vector<TrackAnchor>& anchors) {
+  const double d = cfg.nudge_distance;
+  std::vector<const TrackAnchor*> relevant;
+  for (const TrackAnchor& a : anchors) {
+    if (a.net == group.net) {
+      continue;
+    }
+    if (IntervalsOverlap(a.min_k, a.max_k, group.min_k, group.max_k) &&
+        a.coord >= free_min - d && a.coord <= free_max + d) {
+      relevant.push_back(&a);
+    }
+  }
+  if (relevant.empty()) {
+    return std::clamp(group.coord0, free_min, free_max);
+  }
+
+  std::vector<double> cands;
+  cands.reserve(relevant.size() * 3 + 3);
+  cands.push_back(std::clamp(group.coord0, free_min, free_max));
+  cands.push_back(free_min);
+  cands.push_back(free_max);
+
+  std::vector<double> sorted_coords;
+  sorted_coords.reserve(relevant.size());
+  for (const TrackAnchor* a : relevant) {
+    sorted_coords.push_back(a->coord);
+    const double left_cand = a->coord - d;
+    const double right_cand = a->coord + d;
+    if (left_cand >= free_min - 1e-6 && left_cand <= free_max + 1e-6) {
+      cands.push_back(std::clamp(left_cand, free_min, free_max));
+    }
+    if (right_cand >= free_min - 1e-6 && right_cand <= free_max + 1e-6) {
+      cands.push_back(std::clamp(right_cand, free_min, free_max));
+    }
+  }
+  std::sort(sorted_coords.begin(), sorted_coords.end());
+  for (std::size_t i = 1; i < sorted_coords.size(); ++i) {
+    const double mid = 0.5 * (sorted_coords[i - 1] + sorted_coords[i]);
+    if (mid >= free_min && mid <= free_max) {
+      cands.push_back(mid);
+    }
+  }
+
+  auto min_dist_to_anchors = [&](double x) {
+    double min_dist = 1e9;
+    for (const TrackAnchor* a : relevant) {
+      min_dist = std::min(min_dist, std::abs(x - a->coord));
+    }
+    return min_dist;
+  };
+
+  bool found_clear = false;
+  std::tuple<int, double, double> best_clear{0, 1e18, 0.0};
+  double best_clear_x = group.coord0;
+
+  double best_tight_dist = -1.0;
+  std::tuple<int, double, double> best_tight{0, 1e18, 0.0};
+  double best_tight_x = group.coord0;
+
+  for (double cand : cands) {
+    const double md = min_dist_to_anchors(cand);
+    const int cross = CountGroupCrossings(group, cand, anchors);
+    const double disp = std::abs(cand - group.coord0);
+    if (md >= d - 1e-4) {
+      const std::tuple<int, double, double> score{cross, disp, cand};
+      if (!found_clear || score < best_clear) {
+        found_clear = true;
+        best_clear = score;
+        best_clear_x = cand;
+      }
+    } else if (md > best_tight_dist + 1e-4) {
+      best_tight_dist = md;
+      best_tight = {cross, disp, cand};
+      best_tight_x = cand;
+    } else if (std::abs(md - best_tight_dist) <= 1e-4) {
+      const std::tuple<int, double, double> score{cross, disp, cand};
+      if (score < best_tight) {
+        best_tight = score;
+        best_tight_x = cand;
+      }
+    }
+  }
+
+  if (found_clear) {
+    return best_clear_x;
+  }
+  if (best_tight_dist > 0.5) {
+    return best_tight_x;
+  }
+  return group.coord0;
+}
+
 void NudgeAxis(
     const Config& cfg, const SpatialGridIndex& index,
     const std::unordered_map<Id, Block>& blocks,
     const std::unordered_map<Id, Conn>& conns,
-    const std::vector<Id>& participants, Axis axis,
+    const std::vector<Id>& participants,
+    const std::unordered_set<Id>& mutable_set, bool full_graph, Axis axis,
     std::unordered_map<Id, Route>* routes,
     const std::function<bool(const Conn&, std::vector<Point>*)>& validate_fn,
     const std::function<void(Id)>& on_route_updated,
     std::set<Id>* changed_out) {
   std::vector<MiddleSegment> all_segs =
-      ExtractMiddleSegments(participants, conns, *routes, axis);
+      ExtractMiddleSegments(participants, mutable_set, conns, *routes, axis);
   if (all_segs.size() < 2) {
     return;
+  }
+
+  std::vector<TrackAnchor> base_fixed_anchors;
+  if (!full_graph) {
+    for (const MiddleSegment& s : all_segs) {
+      if (!s.is_mutable) {
+        base_fixed_anchors.push_back({s.net, s.coord, s.min_k, s.max_k,
+                                      s.prev_prim, s.next_prim, s.k_at_seg,
+                                      s.k_at_next});
+      }
+    }
   }
 
   std::sort(all_segs.begin(), all_segs.end(),
@@ -238,12 +470,19 @@ void NudgeAxis(
                      std::tie(b.min_k, b.max_k, b.net, b.conn_id, b.seg_idx);
             });
 
-  // Process coordinate bands separately without cross-bucket double counting.
-  const double band_gap = std::max(1.5, cfg.nudge_distance * 0.8);
+  // On cold-start full pass, routes start un-nudged so coincident tracks sit
+  // within <= 1.5 px; on incremental local passes, include tracks within
+  // nudge_distance so newly placed routes detect nearby fixed tracks.
+  const double band_gap =
+      full_graph ? 1.5 : std::max(1.5, cfg.nudge_distance - 1e-3);
+  const double max_band_span =
+      full_graph ? 2.5 : std::max(16.0, cfg.nudge_distance * 4.0);
   for (std::size_t b_start = 0; b_start < all_segs.size();) {
+    const double anchor = all_segs[b_start].coord;
     std::size_t b_end = b_start + 1;
     while (b_end < all_segs.size() &&
-           all_segs[b_end].coord - all_segs[b_end - 1].coord <= band_gap) {
+           all_segs[b_end].coord - all_segs[b_end - 1].coord < band_gap &&
+           all_segs[b_end].coord - anchor <= max_band_span) {
       ++b_end;
     }
     if (b_end - b_start < 2) {
@@ -272,142 +511,210 @@ void NudgeAxis(
         continue;
       }
 
-      std::vector<TrackGroup> groups;
-      double coord_sum = 0.0;
+      std::vector<TrackGroup> all_groups;
       for (std::size_t k = c_start; k < c_end; ++k) {
         const MiddleSegment* s = &all_segs[k];
-        coord_sum += s->coord;
         auto git =
-            std::find_if(groups.begin(), groups.end(),
+            std::find_if(all_groups.begin(), all_groups.end(),
                          [&](const TrackGroup& g) { return g.net == s->net; });
-        if (git == groups.end()) {
-          groups.push_back({s->net, {s}, 0, 0.0});
+        if (git == all_groups.end()) {
+          all_groups.push_back({s->net, {s}, 0.0, 0.0, 0.0, 0, 0.0});
         } else {
           git->segs.push_back(s);
         }
       }
 
-      if (groups.size() < 2) {
+      if (all_groups.size() < 2) {
         c_start = c_end;
         continue;
       }
 
-      const double coord0 = coord_sum / static_cast<double>(c_end - c_start);
-      for (TrackGroup& g : groups) {
-        ComputeOrderKey(&g);
-      }
-      std::sort(groups.begin(), groups.end(),
-                [](const TrackGroup& a, const TrackGroup& b) {
-                  return std::tie(a.shape_class, a.order_key, a.net) <
-                         std::tie(b.shape_class, b.order_key, b.net);
-                });
-
-      const double search_span = std::max(
-          static_cast<double>(groups.size()) * cfg.nudge_distance * 1.5, 120.0);
-      double free_min = coord0 - search_span;
-      double free_max = coord0 + search_span;
-
-      const Rect query_box = (axis == Axis::kVertical)
-                                 ? Rect{coord0 - search_span - cfg.buffer,
-                                        cluster_min_k - cfg.buffer,
-                                        coord0 + search_span + cfg.buffer,
-                                        cluster_max_k + cfg.buffer}
-                                 : Rect{cluster_min_k - cfg.buffer,
-                                        coord0 - search_span - cfg.buffer,
-                                        cluster_max_k + cfg.buffer,
-                                        coord0 + search_span + cfg.buffer};
-
-      for (Id bid : index.Query(query_box)) {
-        const Rect rb = blocks.at(bid).rect.Pad(cfg.buffer);
-        const double b_min_k = (axis == Axis::kVertical) ? rb.t : rb.l;
-        const double b_max_k = (axis == Axis::kVertical) ? rb.b : rb.r;
-        if (b_max_k <= cluster_min_k + 1e-4 ||
-            b_min_k >= cluster_max_k - 1e-4) {
-          continue;
-        }
-        const double b_min_p = (axis == Axis::kVertical) ? rb.l : rb.t;
-        const double b_max_p = (axis == Axis::kVertical) ? rb.r : rb.b;
-        if (b_max_p <= coord0 + 1e-3) {
-          free_min = std::max(free_min, b_max_p + 0.05);
-        } else if (b_min_p >= coord0 - 1e-3) {
-          free_max = std::min(free_max, b_min_p - 0.05);
-        }
-      }
-
-      for (std::size_t k = c_start; k < c_end; ++k) {
-        const MiddleSegment& s = all_segs[k];
-        if (s.prev_prim < s.coord - 1e-3) {
-          free_min = std::max(free_min, s.prev_prim + 1.0);
-        } else if (s.prev_prim > s.coord + 1e-3) {
-          free_max = std::min(free_max, s.prev_prim - 1.0);
-        }
-        if (s.next_prim < s.coord - 1e-3) {
-          free_min = std::max(free_min, s.next_prim + 1.0);
-        } else if (s.next_prim > s.coord + 1e-3) {
-          free_max = std::min(free_max, s.next_prim - 1.0);
-        }
-      }
-
-      if (free_max <= free_min + 0.5) {
-        c_start = c_end;
-        continue;
-      }
-
-      const std::size_t m = groups.size();
-      const double ideal_span = static_cast<double>(m - 1) * cfg.nudge_distance;
-      std::vector<double> targets(m);
-      if (free_max - free_min >= ideal_span) {
-        const double start = std::clamp(coord0 - 0.5 * ideal_span, free_min,
-                                        free_max - ideal_span);
-        for (std::size_t i = 0; i < m; ++i) {
-          targets[i] = start + static_cast<double>(i) * cfg.nudge_distance;
-        }
-      } else {
-        const double step = (free_max - free_min) / static_cast<double>(m + 1);
-        for (std::size_t i = 0; i < m; ++i) {
-          targets[i] = free_min + static_cast<double>(i + 1) * step;
-        }
-      }
-
-      struct Edit {
-        Id conn_id = 0;
-        std::size_t seg_idx = 0;
-        double target = 0.0;
-      };
-      std::vector<Edit> edits;
-      edits.reserve(c_end - c_start);
-      for (std::size_t i = 0; i < m; ++i) {
-        for (const MiddleSegment* s : groups[i].segs) {
-          edits.push_back({s->conn_id, s->seg_idx, targets[i]});
-        }
-      }
-      std::sort(edits.begin(), edits.end(), [](const Edit& a, const Edit& b) {
-        return std::tie(a.conn_id, a.seg_idx) < std::tie(b.conn_id, b.seg_idx);
-      });
-
-      for (std::size_t e_start = 0; e_start < edits.size();) {
-        const Id cid = edits[e_start].conn_id;
-        std::size_t e_end = e_start + 1;
-        while (e_end < edits.size() && edits[e_end].conn_id == cid) {
-          ++e_end;
-        }
-
-        Route& route = routes->at(cid);
-        std::vector<Point> candidate = route.points;
-        for (std::size_t ei = e_start; ei < e_end; ++ei) {
-          const std::size_t idx = edits[ei].seg_idx;
-          if (idx + 1 < candidate.size()) {
-            SetPrimaryCoord(&candidate[idx], axis, edits[ei].target);
-            SetPrimaryCoord(&candidate[idx + 1], axis, edits[ei].target);
+      std::vector<TrackGroup> mutable_groups;
+      std::vector<std::pair<const MiddleSegment*, double>> edits_src;
+      for (TrackGroup& g : all_groups) {
+        ComputeGroupStats(&g);
+        const MiddleSegment* fixed_rep = nullptr;
+        for (const MiddleSegment* s : g.segs) {
+          if (!s->is_mutable) {
+            fixed_rep = s;
+            break;
           }
         }
-        if (validate_fn(conns.at(cid), &candidate) &&
-            !(candidate == route.points)) {
-          route.points = std::move(candidate);
-          on_route_updated(cid);
-          changed_out->insert(cid);
+        if (fixed_rep != nullptr) {
+          // A same-source fixed sibling anchors the trunk; never shift it,
+          // only align mutable siblings onto that shared trunk if needed.
+          for (const MiddleSegment* s : g.segs) {
+            if (s->is_mutable && std::abs(s->coord - fixed_rep->coord) > 1e-6) {
+              edits_src.emplace_back(s, fixed_rep->coord);
+            }
+          }
+        } else {
+          mutable_groups.push_back(std::move(g));
         }
-        e_start = e_end;
+      }
+
+      if (!mutable_groups.empty()) {
+        std::sort(mutable_groups.begin(), mutable_groups.end(),
+                  [](const TrackGroup& a, const TrackGroup& b) {
+                    return std::tie(a.shape_class, a.order_key, a.net) <
+                           std::tie(b.shape_class, b.order_key, b.net);
+                  });
+
+        const double search_span = std::max(
+            static_cast<double>(all_groups.size()) * cfg.nudge_distance * 1.5,
+            120.0);
+
+        bool can_use_balanced =
+            (mutable_groups.size() >= 2 && base_fixed_anchors.empty());
+        if (mutable_groups.size() >= 2 && !base_fixed_anchors.empty()) {
+          // Allow balanced equidistant layout when all fixed anchors are clear
+          // of the resulting spread.
+          can_use_balanced = true;
+        }
+
+        if (can_use_balanced) {
+          TrackGroup union_mut;
+          double coord_sum = 0.0;
+          std::size_t seg_count = 0;
+          union_mut.min_k = mutable_groups.front().min_k;
+          union_mut.max_k = mutable_groups.front().max_k;
+          for (const TrackGroup& g : mutable_groups) {
+            union_mut.min_k = std::min(union_mut.min_k, g.min_k);
+            union_mut.max_k = std::max(union_mut.max_k, g.max_k);
+            for (const MiddleSegment* s : g.segs) {
+              union_mut.segs.push_back(s);
+              coord_sum += s->coord;
+              ++seg_count;
+            }
+          }
+          union_mut.coord0 = coord_sum / static_cast<double>(seg_count);
+          double free_min = 0.0;
+          double free_max = 0.0;
+          ComputeGroupFreeBounds(cfg, index, blocks, axis, union_mut,
+                                 search_span, &free_min, &free_max);
+
+          if (free_max > free_min + 0.5) {
+            const std::size_t m = mutable_groups.size();
+            const double ideal_span =
+                static_cast<double>(m - 1) * cfg.nudge_distance;
+            std::vector<double> targets(m);
+            if (free_max - free_min >= ideal_span) {
+              const double start =
+                  std::clamp(union_mut.coord0 - 0.5 * ideal_span, free_min,
+                             free_max - ideal_span);
+              for (std::size_t i = 0; i < m; ++i) {
+                targets[i] =
+                    start + static_cast<double>(i) * cfg.nudge_distance;
+              }
+            } else {
+              const double step =
+                  (free_max - free_min) / static_cast<double>(m + 1);
+              for (std::size_t i = 0; i < m; ++i) {
+                targets[i] = free_min + static_cast<double>(i + 1) * step;
+              }
+            }
+
+            bool hits_fixed = false;
+            for (std::size_t i = 0; i < m && !hits_fixed; ++i) {
+              const TrackGroup& g = mutable_groups[i];
+              for (const TrackAnchor& a : base_fixed_anchors) {
+                if (a.net == g.net) {
+                  continue;
+                }
+                if (IntervalsOverlap(a.min_k, a.max_k, g.min_k, g.max_k) &&
+                    std::abs(targets[i] - a.coord) <
+                        cfg.nudge_distance - 1e-4) {
+                  hits_fixed = true;
+                  break;
+                }
+              }
+            }
+            if (!hits_fixed) {
+              for (std::size_t i = 0; i < m; ++i) {
+                for (const MiddleSegment* s : mutable_groups[i].segs) {
+                  edits_src.emplace_back(s, targets[i]);
+                }
+              }
+              mutable_groups.clear();
+            }
+          }
+        }
+
+        if (!mutable_groups.empty()) {
+          // Place each mutable group onto its nearest free non-crossing orbit
+          // against read-only fixed anchors and previously placed mutable ones.
+          std::vector<TrackAnchor> occupied = base_fixed_anchors;
+          for (const TrackGroup& g : mutable_groups) {
+            bool conflicts = false;
+            for (const TrackAnchor& a : occupied) {
+              if (a.net == g.net) {
+                continue;
+              }
+              if (IntervalsOverlap(a.min_k, a.max_k, g.min_k, g.max_k) &&
+                  std::abs(g.coord0 - a.coord) < cfg.nudge_distance - 1e-3) {
+                conflicts = true;
+                break;
+              }
+            }
+
+            double chosen = g.coord0;
+            if (conflicts) {
+              double free_min = 0.0;
+              double free_max = 0.0;
+              ComputeGroupFreeBounds(cfg, index, blocks, axis, g, search_span,
+                                     &free_min, &free_max);
+              if (free_max > free_min + 0.5) {
+                chosen =
+                    PickNearestFreeTrack(cfg, g, free_min, free_max, occupied);
+              }
+            }
+            for (const MiddleSegment* s : g.segs) {
+              if (std::abs(s->coord - chosen) > 1e-6) {
+                edits_src.emplace_back(s, chosen);
+              }
+              occupied.push_back({g.net, chosen, s->min_k, s->max_k,
+                                  s->prev_prim, s->next_prim, s->k_at_seg,
+                                  s->k_at_next});
+            }
+          }
+        }
+      }
+
+      if (!edits_src.empty()) {
+        std::sort(edits_src.begin(), edits_src.end(),
+                  [](const auto& a, const auto& b) {
+                    return std::tie(a.first->conn_id, a.first->seg_idx) <
+                           std::tie(b.first->conn_id, b.first->seg_idx);
+                  });
+
+        for (std::size_t e_start = 0; e_start < edits_src.size();) {
+          const Id cid = edits_src[e_start].first->conn_id;
+          std::size_t e_end = e_start + 1;
+          while (e_end < edits_src.size() &&
+                 edits_src[e_end].first->conn_id == cid) {
+            ++e_end;
+          }
+
+          if (mutable_set.count(cid)) {
+            Route& route = routes->at(cid);
+            std::vector<Point> candidate = route.points;
+            for (std::size_t ei = e_start; ei < e_end; ++ei) {
+              const std::size_t idx = edits_src[ei].first->seg_idx;
+              if (idx + 1 < candidate.size()) {
+                SetPrimaryCoord(&candidate[idx], axis, edits_src[ei].second);
+                SetPrimaryCoord(&candidate[idx + 1], axis,
+                                edits_src[ei].second);
+              }
+            }
+            if (validate_fn(conns.at(cid), &candidate) &&
+                !(candidate == route.points)) {
+              route.points = std::move(candidate);
+              on_route_updated(cid);
+              changed_out->insert(cid);
+            }
+          }
+          e_start = e_end;
+        }
       }
 
       c_start = c_end;
@@ -420,15 +727,16 @@ void NudgeAxis(
 }  // namespace
 
 std::vector<Id> ChannelNudger::Nudge(LocalOrthogonalRouter* router,
-                                     const std::vector<Id>& seed_conns,
+                                     const std::vector<Id>& mutable_conns,
                                      bool full_graph) {
   if (!router->cfg_.enable_channel_nudging) {
     return {};
   }
+  std::unordered_set<Id> mutable_set;
   const std::vector<Id> participants = CollectParticipants(
       router->cfg_, router->index_, router->conns_, router->adjacent_,
-      router->routes_, seed_conns, full_graph);
-  if (participants.size() < 2) {
+      router->routes_, mutable_conns, full_graph, &mutable_set);
+  if (participants.size() < 2 || mutable_set.empty()) {
     return {};
   }
 
@@ -451,11 +759,11 @@ std::vector<Id> ChannelNudger::Nudge(LocalOrthogonalRouter* router,
 
   std::set<Id> changed;
   NudgeAxis(router->cfg_, router->index_, router->blocks_, router->conns_,
-            participants, Axis::kVertical, &router->routes_, validate_fn,
-            on_updated, &changed);
+            participants, mutable_set, full_graph, Axis::kVertical,
+            &router->routes_, validate_fn, on_updated, &changed);
   NudgeAxis(router->cfg_, router->index_, router->blocks_, router->conns_,
-            participants, Axis::kHorizontal, &router->routes_, validate_fn,
-            on_updated, &changed);
+            participants, mutable_set, full_graph, Axis::kHorizontal,
+            &router->routes_, validate_fn, on_updated, &changed);
   return {changed.begin(), changed.end()};
 }
 

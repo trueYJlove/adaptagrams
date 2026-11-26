@@ -60,7 +60,7 @@ class LocalOrthogonalRouter {
   void Publish(Id id, Route route);
   bool ValidateAndSimplifyRoute(const Conn& conn,
                                 std::vector<Point>* points) const;
-  std::vector<Id> ApplyChannelNudging(const std::vector<Id>& seed_conns,
+  std::vector<Id> ApplyChannelNudging(const std::vector<Id>& mutable_conns,
                                       bool full_graph);
 
   friend class AsyncLocalRouter;

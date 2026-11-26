@@ -83,12 +83,12 @@ qt_demo/
 
 为消除多条独立连线走中间通道时重合叠成单线（如平行对连母线、级联走廊重叠）的问题，系统在 `Config::enable_channel_nudging = true` 时于单次重算/冷启动末尾执行轻量级 $O(K \log K)$ 通道分轨（支持通过 `LocalOrthogonalRouter::set_enable_channel_nudging(bool)` 与 `AsyncLocalRouter::set_enable_channel_nudging(bool)` 运行时切换）：
 
-1. **参与集边界控制**：
-   * 局部重算（`RerouteAffected`、`RouteConnector` 及 `AsyncLocalRouter::Poll` 波次收口）：收集本次变化连线联合包围盒外扩 `max(2 * nudge_distance, 80.0)` 内的邻近模块关联连线，上限严格截断在 **256 条**（确保单拖 P99 不退化）。
-   * 全图冷启动（`RouteAllParallel` 合并后）：对全图 `Status::kValid` 连线按确定性升序 `Id` 执行单趟分轨（保持多线程/单线程冷启动输出完全一致）。
-2. **中间段与电气网表语义（`NetKey`）**：仅平移 `pts.size() >= 4` 连线的中间正交段（索引 `[1, pts.size() - 3]`），绝不篡改起止引脚位置与出线方向；按 `NetKey { src_block, src_pin }` 归组——**同一源引脚扇出允许共享主干，不同 `NetKey` 独立信号强制分轨**。
-3. **坐标带分桶 + 区间冲突聚类 + 无交叉排序**：分别处理垂直与水平中间段；将相邻坐标差距 `<= max(1.5, 0.8 * nudge_distance)` 的近距线段并入同带，并按另一维区间重叠划分冲突簇；采用确定性 Minimal-Crossing 排序键（对 Z 型/U 型正反向自动选定不交叉序，并以 `NetKey` 打破平局）排定轨道次序。
-4. **安全净宽夹紧 + 逐线全局复验回滚**：通过 `SpatialGridIndex::Query` 找出同跨度左右/上下障碍物膨胀框及相邻拐点约束得到安全通道 `[free_min, free_max]`，按 `nudge_distance`（空间不足时按 `(free_max - free_min) / (M + 1)` 均分）分配新坐标；每条调整后走 `ValidateAndSimplifyRoute()` 全量碰撞与正交复验，若任一线冲突仅单线回滚，**100% 保留原有 `Valid` 合法率**。
+1. **活动线与只读锚定线严格隔离（`mutable_conns` vs Fixed Anchors）**：
+   * 全图冷启动（`RouteAllParallel` 合并后，`full_graph = true`）：全图 `Status::kValid` 连线均属于可移动集，按确定性升序 `Id` 执行单趟全图等距分轨。
+   * 交互拖拽与局部编辑（`RerouteAffected`、`RouteConnector` 及 `AsyncLocalRouter::Poll` 局部收口，`full_graph = false`）：仅本次重算的直连线集为 `mutable_conns`；联合包围盒外扩 `max(2 * nudge_distance, 80.0)` 查询到的邻近非关联连线（参与上限 `256` 条）**仅作为只读占用轨道（Fixed Anchors）参与冲突检测与避让**，严禁修改任何非 `mutable_conns` 连线，确保拖拽时非关联线 100% 静止。
+2. **中间段与电气网表语义（`NetKey`）**：仅平移 `pts.size() >= 4` 连线的中间正交段（索引 `[1, pts.size() - 3]`），绝不篡改起止引脚位置与出线方向；按 `NetKey { src_block, src_pin }` 归组——**同一源引脚扇出允许共享主干，不同 `NetKey` 独立信号强制分轨**（同源固定线已存在时新扇出优先锚定其主干）。
+3. **坐标带分桶 + 区间冲突聚类 + 固定轨道避让分配**：分别处理垂直与水平中间段；冷启动按 `<= 1.5 px` 聚合共线坐标带，交互态按 `< nudge_distance` 收集冲突簇。若簇内均为可动线且不撞固定轨道，按 Minimal-Crossing 排序在 `[free_min, free_max]` 内居中均匀摊开；当可动线与只读固定线坐标差 `< nudge_distance - 1e-3` 且区间重叠时，固定线纹丝不动，可动线按**最小交叉优先 + 距原坐标最近 + 与全部重叠固定线/已放轨道间距 `>= nudge_distance`** 的准则落位至空闲轨道。
+4. **安全净宽夹紧 + 逐线全局复验回滚**：通过 `SpatialGridIndex::Query` 找出同跨度左右/上下障碍物膨胀框及相邻拐点约束得到安全通道 `[free_min, free_max]`（空间极窄不足 `2 * nudge_distance` 时自动选择最大净空子隙中心）；每条调整后走 `ValidateAndSimplifyRoute()` 全量碰撞与正交复验，若任一线冲突仅单线回滚，**100% 保留原有 `Valid` 合法率**。
 
 ### 3.5 异步会话模型（`AsyncLocalRouter`）
 
@@ -243,8 +243,8 @@ localroute::LocalOrthogonalRouter router(cfg, std::make_shared<CustomSolver>());
 
 | 场景（10,000 模块 / 20,000 连线） | 指标 | 实测表现 |
 | :--- | :--- | :--- |
-| 同步 4 线程全图冷启动 | 总耗时 / 合法率 | **2.34 s**（`2338.52 ms`） / **99.53%**（19,906 Valid, 94 DisplayOnly, 0 Failed） |
-| 同步单模块拖拽（200 帧） | P50 / P99 | **0.966 ms** / **4.347 ms**（非关联线误提交 0） |
-| 同步 20 模块框选拖拽（200 帧） | P50 / P99 | **1.904 ms** / **4.638 ms** |
-| 同步穿插密集连线区（200 帧） | P50 / P99 | **0.973 ms** / **2.821 ms**（非关联线误提交 0） |
-| `qt_demo` Async 10k 交互冒烟 | `Route Time` / `Paint Time` | **0.027 ~ 0.106 ms** / **5.02 ~ 6.84 ms** |
+| 同步 4 线程全图冷启动 | 总耗时 / 合法率 | **2.38 s**（`2377.42 ms`） / **99.53%**（19,906 Valid, 94 DisplayOnly, 0 Failed） |
+| 同步单模块拖拽（200 帧） | P50 / P99 | **0.404 ms** / **3.635 ms**（非关联线误提交 0） |
+| 同步 20 模块框选拖拽（200 帧） | P50 / P99 | **1.687 ms** / **3.982 ms** |
+| 同步穿插密集连线区（200 帧） | P50 / P99 | **0.682 ms** / **1.883 ms**（非关联线误提交 0） |
+| `qt_demo` Async 10k 交互冒烟 | `Route Time` / `Paint Time` | **0.017 ~ 0.057 ms** / **7.07 ~ 10.16 ms** |

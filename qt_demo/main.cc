@@ -151,6 +151,16 @@ int main(int argc, char* argv[]) {
   canvas->SetEnableChannelNudging(true);
   canvas->render(&scratch);
 
+  // Verify dragging B3 in qt_demo does not move anchored B9->B10.
+  const std::vector<localroute::Point> frozen_b9_qt =
+      canvas->router_view().route(1).points;
+  canvas->StepSmokeDrag({3}, 80.0, 0.0);
+  canvas->render(&scratch);
+  if (!(canvas->router_view().route(1).points == frozen_b9_qt) ||
+      canvas->router_view().route(2).status != localroute::Status::kValid) {
+    throw std::runtime_error("preset cascade drag anchor invariance failed");
+  }
+
   std::cout << "SMOKE_PASS" << " async_cold_route_ms=" << async_cold_route_ms
             << " async_cold_paint_ms=" << async_cold_paint_ms
             << " async_vis=" << async_vis_blocks << "/" << async_vis_conns
