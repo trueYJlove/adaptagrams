@@ -528,6 +528,120 @@ bool LocalOrthogonalRouter::ValidateAndSimplifyRoute(
   return true;
 }
 
+bool LocalOrthogonalRouter::ValidateNudgedMiddleSegment(
+    const Conn& c, const std::vector<Point>& p, std::size_t seg_index) const {
+  if (p.size() < 4 || seg_index < 1 || seg_index + 2 >= p.size()) {
+    return false;
+  }
+  const auto& src = blocks_.at(c.src);
+  const auto& dst = blocks_.at(c.dst);
+  const Pin sp = FindPin(src, c.sp);
+  const Pin dp = FindPin(dst, c.dp);
+  const Point a = PinPosition(src.rect, sp);
+  const Point b = PinPosition(dst.rect, dp);
+  if (!(p.front() == a && p.back() == b)) {
+    return false;
+  }
+  if (seg_index == 1 && !(OrthoDir(a, p[1]) & sp.dirs)) {
+    return false;
+  }
+  if (seg_index + 2 == p.size() - 1 &&
+      !(OrthoDir(b, p[p.size() - 2]) & dp.dirs)) {
+    return false;
+  }
+  for (std::size_t j = seg_index; j <= seg_index + 2; ++j) {
+    if (!OrthoDir(p[j - 1], p[j])) {
+      return false;
+    }
+  }
+
+  bool has_src_buf = false;
+  double src_buf = cfg_.buffer;
+  Rect aa = src.rect;
+  auto get_src_buf = [&]() {
+    if (!has_src_buf) {
+      src_buf =
+          ComputeTerminalBufferFromIndex(index_, blocks_, c, a, cfg_.buffer);
+      aa = src.rect.Pad(src_buf);
+      has_src_buf = true;
+    }
+    return src_buf;
+  };
+  bool has_dst_buf = false;
+  double dst_buf = cfg_.buffer;
+  Rect bb = dst.rect;
+  auto get_dst_buf = [&]() {
+    if (!has_dst_buf) {
+      dst_buf =
+          ComputeTerminalBufferFromIndex(index_, blocks_, c, b, cfg_.buffer);
+      bb = dst.rect.Pad(dst_buf);
+      has_dst_buf = true;
+    }
+    return dst_buf;
+  };
+
+  for (std::size_t j = seg_index; j <= seg_index + 2; ++j) {
+    const Point u = p[j - 1];
+    const Point v = p[j];
+    const std::vector<Id> ids = index_.Query(Box(u, v).Pad(cfg_.buffer));
+    if (j == 1 && !has_src_buf) {
+      for (Id id : ids) {
+        if (id == c.src || id == c.dst) {
+          continue;
+        }
+        const Rect r = blocks_.at(id).rect;
+        if (r.Inside(a)) {
+          continue;
+        }
+        const double g = RectPointGap(r, a);
+        if (g < cfg_.buffer) {
+          src_buf = std::min(src_buf, std::max(0.0, g * 0.5 - 0.5));
+        }
+      }
+      aa = src.rect.Pad(src_buf);
+      has_src_buf = true;
+    }
+    if (j + 1 == p.size() && !has_dst_buf) {
+      for (Id id : ids) {
+        if (id == c.src || id == c.dst) {
+          continue;
+        }
+        const Rect r = blocks_.at(id).rect;
+        if (r.Inside(b)) {
+          continue;
+        }
+        const double g = RectPointGap(r, b);
+        if (g < cfg_.buffer) {
+          dst_buf = std::min(dst_buf, std::max(0.0, g * 0.5 - 0.5));
+        }
+      }
+      bb = dst.rect.Pad(dst_buf);
+      has_dst_buf = true;
+    }
+    for (Id id : ids) {
+      const Rect raw = blocks_.at(id).rect;
+      double buf = 0.0;
+      if (id == c.src) {
+        buf = get_src_buf();
+      } else if (id == c.dst) {
+        buf = get_dst_buf();
+      } else {
+        buf = EffectiveObstacleBuffer(raw, a, b, cfg_.buffer);
+      }
+      const Rect rect = raw.Pad(buf);
+      if (!Crosses(u, v, rect)) {
+        continue;
+      }
+      if ((id == c.src && j == 1 && CanExit(u, v, src.rect, aa)) ||
+          (id == c.dst && j + 1 == p.size() && CanExit(v, u, dst.rect, bb))) {
+        continue;
+      }
+      return false;
+    }
+  }
+  return true;
+}
+
 std::vector<Point> LocalOrthogonalRouter::Preview(Id id) const {
   const auto& c = conns_.at(id);
   const auto& a = blocks_.at(c.src);

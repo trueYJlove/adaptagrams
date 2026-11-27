@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "localroute/local_route_solver.h"
@@ -99,6 +100,80 @@ class SpatialGrid {
     for (const auto& entry : overflow_) {
       if (entry.second.Intersects(a)) {
         ids.push_back(entry.first);
+      }
+    }
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    return ids;
+  }
+
+  std::vector<Item> QueryUnion(const std::vector<Rect>& areas) const {
+    if (areas.empty()) {
+      return {};
+    }
+    if (areas.size() == 1) {
+      return Query(areas.front());
+    }
+    std::vector<std::pair<Key, std::size_t>> cell_areas;
+    cell_areas.reserve(areas.size() * 4);
+    for (std::size_t i = 0; i < areas.size(); ++i) {
+      const Range g = GetRange(areas[i]);
+      if (g.Count() > std::max<std::int64_t>(32, boxes_.size())) {
+        std::vector<Item> ids;
+        for (const auto& entry : boxes_) {
+          for (const Rect& box : areas) {
+            if (entry.second.Intersects(box)) {
+              ids.push_back(entry.first);
+              break;
+            }
+          }
+        }
+        for (const auto& entry : overflow_) {
+          for (const Rect& box : areas) {
+            if (entry.second.Intersects(box)) {
+              ids.push_back(entry.first);
+              break;
+            }
+          }
+        }
+        std::sort(ids.begin(), ids.end());
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        return ids;
+      }
+      Visit(g, [&](Key k) { cell_areas.emplace_back(k, i); });
+    }
+    std::sort(
+        cell_areas.begin(), cell_areas.end(), [](const auto& a, const auto& b) {
+          return a.first != b.first ? a.first < b.first : a.second < b.second;
+        });
+
+    std::vector<Item> ids;
+    for (std::size_t c_start = 0; c_start < cell_areas.size();) {
+      const Key k = cell_areas[c_start].first;
+      std::size_t c_end = c_start + 1;
+      while (c_end < cell_areas.size() && cell_areas[c_end].first == k) {
+        ++c_end;
+      }
+      const auto it = cells_.find(k);
+      if (it != cells_.end()) {
+        for (Item id : it->second) {
+          const Rect& r = boxes_.at(id);
+          for (std::size_t ci = c_start; ci < c_end; ++ci) {
+            if (r.Intersects(areas[cell_areas[ci].second])) {
+              ids.push_back(id);
+              break;
+            }
+          }
+        }
+      }
+      c_start = c_end;
+    }
+    for (const auto& entry : overflow_) {
+      for (const Rect& box : areas) {
+        if (entry.second.Intersects(box)) {
+          ids.push_back(entry.first);
+          break;
+        }
       }
     }
     std::sort(ids.begin(), ids.end());

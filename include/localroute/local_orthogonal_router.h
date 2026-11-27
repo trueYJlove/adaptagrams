@@ -65,6 +65,9 @@ class LocalOrthogonalRouter {
   void Publish(Id id, Route route);
   bool ValidateAndSimplifyRoute(const Conn& conn,
                                 std::vector<Point>* points) const;
+  bool ValidateNudgedMiddleSegment(const Conn& conn,
+                                   const std::vector<Point>& points,
+                                   std::size_t seg_index) const;
   std::vector<Id> ApplyChannelNudging(const std::vector<Id>& mutable_conns,
                                       bool full_graph);
 

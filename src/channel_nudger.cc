@@ -86,17 +86,6 @@ void SetPrimaryCoord(Point* p, Axis axis, double value) {
   }
 }
 
-Rect RouteBounds(const std::vector<Point>& pts) {
-  Rect b{pts.front().x, pts.front().y, pts.front().x, pts.front().y};
-  for (const Point p : pts) {
-    b.l = std::min(b.l, p.x);
-    b.r = std::max(b.r, p.x);
-    b.t = std::min(b.t, p.y);
-    b.b = std::max(b.b, p.y);
-  }
-  return b;
-}
-
 bool IntervalsOverlap(double min_a, double max_a, double min_b, double max_b) {
   return min_a < max_b - 1e-3 && min_b < max_a - 1e-3;
 }
@@ -112,26 +101,26 @@ bool CrossesOrthoPrimVert(double h_prim0, double h_prim1, double h_k,
 }
 
 int CountGroupCrossings(const TrackGroup& group, double cand_coord,
-                        const std::vector<TrackAnchor>& anchors) {
+                        const std::vector<const TrackAnchor*>& anchors) {
   int crossings = 0;
   for (const MiddleSegment* s : group.segs) {
-    for (const TrackAnchor& a : anchors) {
-      if (a.net == group.net) {
+    for (const TrackAnchor* a : anchors) {
+      if (a->net == group.net) {
         continue;
       }
-      if (CrossesOrthoPrimVert(s->prev_prim, cand_coord, s->k_at_seg, a.coord,
-                               a.k_at_seg, a.k_at_next)) {
+      if (CrossesOrthoPrimVert(s->prev_prim, cand_coord, s->k_at_seg, a->coord,
+                               a->k_at_seg, a->k_at_next)) {
         ++crossings;
       }
-      if (CrossesOrthoPrimVert(cand_coord, s->next_prim, s->k_at_next, a.coord,
-                               a.k_at_seg, a.k_at_next)) {
+      if (CrossesOrthoPrimVert(cand_coord, s->next_prim, s->k_at_next, a->coord,
+                               a->k_at_seg, a->k_at_next)) {
         ++crossings;
       }
-      if (CrossesOrthoPrimVert(a.prev_prim, a.coord, a.k_at_seg, cand_coord,
+      if (CrossesOrthoPrimVert(a->prev_prim, a->coord, a->k_at_seg, cand_coord,
                                s->k_at_seg, s->k_at_next)) {
         ++crossings;
       }
-      if (CrossesOrthoPrimVert(a.coord, a.next_prim, a.k_at_next, cand_coord,
+      if (CrossesOrthoPrimVert(a->coord, a->next_prim, a->k_at_next, cand_coord,
                                s->k_at_seg, s->k_at_next)) {
         ++crossings;
       }
@@ -163,8 +152,6 @@ std::vector<Id> CollectParticipants(
     return {selected.begin(), selected.end()};
   }
 
-  bool has_box = false;
-  Rect union_box{0, 0, 0, 0};
   for (Id cid : mutable_conns) {
     const auto rit = routes.find(cid);
     if (rit == routes.end() || rit->second.status != Status::kValid ||
@@ -175,41 +162,122 @@ std::vector<Id> CollectParticipants(
     if (!rit->second.user_modified) {
       mutable_set_out->insert(cid);
     }
-    const Rect rb = RouteBounds(rit->second.points);
-    if (!has_box) {
-      union_box = rb;
-      has_box = true;
-    } else {
-      union_box.l = std::min(union_box.l, rb.l);
-      union_box.t = std::min(union_box.t, rb.t);
-      union_box.r = std::max(union_box.r, rb.r);
-      union_box.b = std::max(union_box.b, rb.b);
-    }
   }
-  if (!has_box) {
+  if (mutable_set_out->empty()) {
     return {};
   }
 
   const std::size_t cap = std::max(kMaxLocalConns, selected.size());
   const double pad = std::max(cfg.nudge_distance * 2.0, 80.0);
-  const std::vector<Id> nearby_blocks = index.Query(union_box.Pad(pad));
-  for (Id bid : nearby_blocks) {
-    if (selected.size() >= cap) {
-      break;
-    }
-    const auto ait = adjacent.find(bid);
-    if (ait == adjacent.end()) {
-      continue;
-    }
-    for (Id cid : ait->second) {
+
+  auto collect_from_blocks = [&](const std::vector<Id>& block_ids) {
+    for (Id bid : block_ids) {
       if (selected.size() >= cap) {
-        break;
+        return;
       }
-      const auto rit = routes.find(cid);
-      if (rit != routes.end() && rit->second.status == Status::kValid &&
-          rit->second.points.size() >= 4) {
-        selected.insert(cid);
+      const auto ait = adjacent.find(bid);
+      if (ait == adjacent.end()) {
+        continue;
       }
+      for (Id adj_cid : ait->second) {
+        if (selected.size() >= cap) {
+          return;
+        }
+        const auto rit = routes.find(adj_cid);
+        if (rit != routes.end() && rit->second.status == Status::kValid &&
+            rit->second.points.size() >= 4) {
+          selected.insert(adj_cid);
+        }
+      }
+    }
+  };
+
+  // Query narrow strips along movable middle segments j in [1, pts.size()-3].
+  // Compact local segments (bounding <= 32 grid cells) coalesce into a single
+  // SpatialGrid::Query; wider/long-span segments query in bounded narrow
+  // strip batches and stop once selected reaches cap.
+  std::vector<Id> mut_ids(mutable_set_out->begin(), mutable_set_out->end());
+  std::sort(mut_ids.begin(), mut_ids.end());
+
+  std::vector<Rect> short_strips;
+  std::vector<Rect> long_strips;
+  short_strips.reserve(mut_ids.size() * 2);
+  bool has_short_bounds = false;
+  Rect short_bounds{0, 0, 0, 0};
+  for (Id cid : mut_ids) {
+    const auto& pts = routes.at(cid).points;
+    for (std::size_t j = 1; j + 2 < pts.size(); ++j) {
+      const Rect seg_box = Box(pts[j], pts[j + 1]);
+      if (std::max(seg_box.r - seg_box.l, seg_box.b - seg_box.t) <= 600.0) {
+        const Rect padded = seg_box.Pad(pad);
+        short_strips.push_back(padded);
+        if (!has_short_bounds) {
+          short_bounds = padded;
+          has_short_bounds = true;
+        } else {
+          short_bounds.l = std::min(short_bounds.l, padded.l);
+          short_bounds.t = std::min(short_bounds.t, padded.t);
+          short_bounds.r = std::max(short_bounds.r, padded.r);
+          short_bounds.b = std::max(short_bounds.b, padded.b);
+        }
+      } else {
+        long_strips.push_back(seg_box.Pad(pad));
+      }
+    }
+  }
+  if (has_short_bounds) {
+    const std::int64_t cells_w =
+        1LL + static_cast<std::int64_t>(std::floor(short_bounds.r / cfg.cell)) -
+        static_cast<std::int64_t>(std::floor(short_bounds.l / cfg.cell));
+    const std::int64_t cells_h =
+        1LL + static_cast<std::int64_t>(std::floor(short_bounds.b / cfg.cell)) -
+        static_cast<std::int64_t>(std::floor(short_bounds.t / cfg.cell));
+    if (cells_w * cells_h <= 32) {
+      collect_from_blocks(index.Query(short_bounds));
+    } else {
+      constexpr std::size_t kShortBatchSize = 8;
+      std::vector<Rect> batch;
+      batch.reserve(kShortBatchSize);
+      for (std::size_t i = 0; i < short_strips.size() && selected.size() < cap;
+           i += kShortBatchSize) {
+        batch.clear();
+        const std::size_t end =
+            std::min(short_strips.size(), i + kShortBatchSize);
+        for (std::size_t k = i; k < end; ++k) {
+          batch.push_back(short_strips[k]);
+        }
+        collect_from_blocks(index.QueryUnion(batch));
+      }
+    }
+  }
+  if (selected.size() < cap && !long_strips.empty()) {
+    constexpr std::size_t kBatchSize = 4;
+    const std::size_t max_batches = (selected.size() >= 128) ? 1 : 4;
+    std::vector<Rect> batch;
+    batch.reserve(kBatchSize);
+    std::size_t batches = 0;
+    for (std::size_t i = 0; i < long_strips.size() && selected.size() < cap &&
+                            batches < max_batches;
+         i += kBatchSize, ++batches) {
+      batch.clear();
+      const std::size_t end = std::min(long_strips.size(), i + kBatchSize);
+      for (std::size_t k = i; k < end; ++k) {
+        batch.push_back(long_strips[k]);
+      }
+      collect_from_blocks(index.QueryUnion(batch));
+    }
+  }
+  if (selected.size() < 16) {
+    std::vector<Rect> terminal_boxes;
+    for (Id cid : mut_ids) {
+      const Conn& c = conns.at(cid);
+      collect_from_blocks({c.src, c.dst});
+      const auto& pts = routes.at(cid).points;
+      terminal_boxes.push_back(Box(pts.front(), pts.front()).Pad(pad));
+      terminal_boxes.push_back(Box(pts.back(), pts.back()).Pad(pad));
+    }
+    if (selected.size() < cap && !terminal_boxes.empty()) {
+      collect_from_blocks(index.QueryUnion(terminal_boxes));
     }
   }
   return {selected.begin(), selected.end()};
@@ -389,6 +457,19 @@ double PickNearestFreeTrack(const Config& cfg, const TrackGroup& group,
     }
   }
 
+  // Sort candidates by (displacement, cand) ascending and remove exact
+  // duplicates so the first clear zero-crossing candidate is provably optimal.
+  std::sort(cands.begin(), cands.end());
+  cands.erase(std::unique(cands.begin(), cands.end()), cands.end());
+  std::sort(cands.begin(), cands.end(), [&](double a, double b) {
+    const double da = std::abs(a - group.coord0);
+    const double db = std::abs(b - group.coord0);
+    if (da != db) {
+      return da < db;
+    }
+    return a < b;
+  });
+
   auto min_dist_to_anchors = [&](double x) {
     double min_dist = 1e9;
     for (const TrackAnchor* a : relevant) {
@@ -405,26 +486,60 @@ double PickNearestFreeTrack(const Config& cfg, const TrackGroup& group,
   std::tuple<int, double, double> best_tight{0, 1e18, 0.0};
   double best_tight_x = group.coord0;
 
+  double g_p_min = free_min;
+  double g_p_max = free_max;
+  for (const MiddleSegment* s : group.segs) {
+    g_p_min = std::min({g_p_min, s->prev_prim, s->next_prim});
+    g_p_max = std::max({g_p_max, s->prev_prim, s->next_prim});
+  }
+  std::vector<const TrackAnchor*> cross_anchors;
+  cross_anchors.reserve(32);
+  for (const TrackAnchor& a : anchors) {
+    if (a.net == group.net) {
+      continue;
+    }
+    const double a_p_min = std::min({a.prev_prim, a.coord, a.next_prim});
+    const double a_p_max = std::max({a.prev_prim, a.coord, a.next_prim});
+    if (a_p_max > g_p_min + 1e-6 && g_p_max > a_p_min + 1e-6 &&
+        a.max_k > group.min_k - 1e-3 && group.max_k > a.min_k - 1e-3) {
+      cross_anchors.push_back(&a);
+    }
+  }
+
   for (double cand : cands) {
     const double md = min_dist_to_anchors(cand);
-    const int cross = CountGroupCrossings(group, cand, anchors);
-    const double disp = std::abs(cand - group.coord0);
     if (md >= d - 1e-4) {
+      const int cross = cross_anchors.empty()
+                            ? 0
+                            : CountGroupCrossings(group, cand, cross_anchors);
+      if (cross == 0) {
+        return cand;
+      }
+      const double disp = std::abs(cand - group.coord0);
       const std::tuple<int, double, double> score{cross, disp, cand};
       if (!found_clear || score < best_clear) {
         found_clear = true;
         best_clear = score;
         best_clear_x = cand;
       }
-    } else if (md > best_tight_dist + 1e-4) {
-      best_tight_dist = md;
-      best_tight = {cross, disp, cand};
-      best_tight_x = cand;
-    } else if (std::abs(md - best_tight_dist) <= 1e-4) {
-      const std::tuple<int, double, double> score{cross, disp, cand};
-      if (score < best_tight) {
-        best_tight = score;
+    } else if (!found_clear) {
+      const double disp = std::abs(cand - group.coord0);
+      if (md > best_tight_dist + 1e-4) {
+        best_tight_dist = md;
+        const int cross = cross_anchors.empty()
+                              ? 0
+                              : CountGroupCrossings(group, cand, cross_anchors);
+        best_tight = {cross, disp, cand};
         best_tight_x = cand;
+      } else if (std::abs(md - best_tight_dist) <= 1e-4) {
+        const int cross = cross_anchors.empty()
+                              ? 0
+                              : CountGroupCrossings(group, cand, cross_anchors);
+        const std::tuple<int, double, double> score{cross, disp, cand};
+        if (score < best_tight) {
+          best_tight = score;
+          best_tight_x = cand;
+        }
       }
     }
   }
@@ -446,6 +561,8 @@ void NudgeAxis(
     const std::unordered_set<Id>& mutable_set, bool full_graph, Axis axis,
     std::unordered_map<Id, Route>* routes,
     const std::function<bool(const Conn&, std::vector<Point>*)>& validate_fn,
+    const std::function<bool(const Conn&, const std::vector<Point>&,
+                             std::size_t)>& validate_seg_fn,
     const std::function<void(Id)>& on_route_updated,
     std::set<Id>* changed_out) {
   std::vector<MiddleSegment> all_segs =
@@ -491,6 +608,19 @@ void NudgeAxis(
       b_start = b_end;
       continue;
     }
+    if (!full_graph) {
+      bool band_has_mut = false;
+      for (std::size_t k = b_start; k < b_end; ++k) {
+        if (all_segs[k].is_mutable) {
+          band_has_mut = true;
+          break;
+        }
+      }
+      if (!band_has_mut) {
+        b_start = b_end;
+        continue;
+      }
+    }
 
     std::sort(all_segs.begin() + b_start, all_segs.begin() + b_end,
               [](const MiddleSegment& a, const MiddleSegment& b) {
@@ -511,6 +641,19 @@ void NudgeAxis(
       if (c_end - c_start < 2) {
         c_start = c_end;
         continue;
+      }
+      if (!full_graph) {
+        bool cluster_has_mut = false;
+        for (std::size_t k = c_start; k < c_end; ++k) {
+          if (all_segs[k].is_mutable) {
+            cluster_has_mut = true;
+            break;
+          }
+        }
+        if (!cluster_has_mut) {
+          c_start = c_end;
+          continue;
+        }
       }
 
       std::vector<TrackGroup> all_groups;
@@ -708,11 +851,28 @@ void NudgeAxis(
                                 edits_src[ei].second);
               }
             }
-            if (validate_fn(conns.at(cid), &candidate) &&
-                !(candidate == route.points)) {
-              route.points = std::move(candidate);
-              on_route_updated(cid);
-              changed_out->insert(cid);
+            if (!(candidate == route.points)) {
+              bool ok = false;
+              if (e_end - e_start == 1) {
+                const std::size_t seg_idx = edits_src[e_start].first->seg_idx;
+                const double new_coord = edits_src[e_start].second;
+                if (std::isfinite(new_coord) && std::abs(new_coord) <= 5e7 &&
+                    seg_idx >= 1 && seg_idx + 2 < candidate.size() &&
+                    !(candidate[seg_idx - 1] == candidate[seg_idx]) &&
+                    !(candidate[seg_idx] == candidate[seg_idx + 1]) &&
+                    !(candidate[seg_idx + 1] == candidate[seg_idx + 2])) {
+                  ok = validate_seg_fn(conns.at(cid), candidate, seg_idx);
+                } else {
+                  ok = validate_fn(conns.at(cid), &candidate);
+                }
+              } else {
+                ok = validate_fn(conns.at(cid), &candidate);
+              }
+              if (ok && !(candidate == route.points)) {
+                route.points = std::move(candidate);
+                on_route_updated(cid);
+                changed_out->insert(cid);
+              }
             }
           }
           e_start = e_end;
@@ -745,6 +905,10 @@ std::vector<Id> ChannelNudger::Nudge(LocalOrthogonalRouter* router,
   auto validate_fn = [&](const Conn& conn, std::vector<Point>* pts) {
     return router->ValidateAndSimplifyRoute(conn, pts);
   };
+  auto validate_seg_fn = [&](const Conn& conn, const std::vector<Point>& pts,
+                             std::size_t seg_idx) {
+    return router->ValidateNudgedMiddleSegment(conn, pts, seg_idx);
+  };
   auto on_updated = [&](Id cid) {
     if (!router->cfg_.reroute_third_party_blocked) {
       return;
@@ -762,10 +926,12 @@ std::vector<Id> ChannelNudger::Nudge(LocalOrthogonalRouter* router,
   std::set<Id> changed;
   NudgeAxis(router->cfg_, router->index_, router->blocks_, router->conns_,
             participants, mutable_set, full_graph, Axis::kVertical,
-            &router->routes_, validate_fn, on_updated, &changed);
+            &router->routes_, validate_fn, validate_seg_fn, on_updated,
+            &changed);
   NudgeAxis(router->cfg_, router->index_, router->blocks_, router->conns_,
             participants, mutable_set, full_graph, Axis::kHorizontal,
-            &router->routes_, validate_fn, on_updated, &changed);
+            &router->routes_, validate_fn, validate_seg_fn, on_updated,
+            &changed);
   return {changed.begin(), changed.end()};
 }
 

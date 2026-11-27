@@ -47,8 +47,8 @@ qt_demo/
 
 * **网格映射**：按 `Config::cell`（默认 `256.0`）使用 `std::floor(x / cell_)` 将二维坐标映射到整数格坐标，将 `(int32_t x, int32_t y)` 打包为 `uint64_t` 键，正确支持负坐标。
 * **增量更新**：`Update(id, new_rect)` 始终刷新精确包围盒 `boxes_[id]`；当新旧矩形覆盖的网格区间不变时，直接跳过网格桶搬移。
-* **内部单元免哈希优化**：`Query(area)` 遍历查询矩形覆盖的网格时，仅对边界格元素执行精确相交判断 `boxes_.at(id).Intersects(area)`；完全落入查询框内部的网格直接批量拷贝，最后排序去重。
-* **并发只读安全**：`Query()` 为严格无副作用的 `const` 方法（不在实例内维护可变 `queryStamp`），支持 `RouteAllParallel()` 多线程并发只读查询。
+* **内部单元免哈希优化与联合窄条查询**：`Query(area)` 遍历查询矩形覆盖的网格时，仅对边界格元素执行精确相交判断 `boxes_.at(id).Intersects(area)`；完全落入查询框内部的网格直接批量拷贝，最后排序去重。补充 `QueryUnion(areas)` 对多窄条矩形跨格键做单次去重合并，供分轨阶段规避长线二维外包框膨胀。
+* **并发只读安全**：`Query()` 与 `QueryUnion()` 均为严格无副作用的 `const` 方法（不在实例内维护可变 `queryStamp`），支持 `RouteAllParallel()` 多线程并发只读查询。
 
 ### 3.2 多级路由管线（`LocalOrthogonalRouter::SolveOne`）
 
@@ -99,10 +99,10 @@ qt_demo/
 
 1. **活动线与只读锚定线严格隔离（`mutable_conns` vs Fixed Anchors）**：
    * 全图冷启动（`RouteAllParallel` 合并后，`full_graph = true`）：全图 `Status::kValid` 且 `user_modified == false` 的连线属于可移动集，按确定性升序 `Id` 执行单趟全图等距分轨；凡 `user_modified == true` 的连线在全图与局部模式下均作为只读锚定轨道（Fixed Anchors），不被擅自挪动。
-   * 交互拖拽与局部编辑（`RerouteAffected`、`RouteConnector`、`AutoRouteConnectors` 及 `AsyncLocalRouter::Poll` 局部收口，`full_graph = false`）：仅本次重算且未锁定（`!user_modified`）的直连线集为 `mutable_conns`；联合包围盒外扩 `max(2 * nudge_distance, 80.0)` 查询到的邻近非关联连线（参与上限 `256` 条）及所有 `user_modified == true` 连线**仅作为只读占用轨道（Fixed Anchors）参与冲突检测与避让**，严禁修改任何非 `mutable_conns` 或手动锁定连线，确保拖拽时非关联线与手调线 100% 静止。
-2. **中间段与电气网表语义（`NetKey`）**：仅平移 `pts.size() >= 4` 连线的中间正交段（索引 `[1, pts.size() - 3]`），绝不篡改起止引脚位置与出线方向；按 `NetKey { src_block, src_pin }` 归组——**同一源引脚扇出允许共享主干，不同 `NetKey` 独立信号强制分轨**（同源固定线已存在时新扇出优先锚定其主干）。
-3. **坐标带分桶 + 区间冲突聚类 + 固定轨道避让分配**：分别处理垂直与水平中间段；冷启动按 `<= 1.5 px` 聚合共线坐标带，交互态按 `< nudge_distance` 收集冲突簇。若簇内均为可动线且不撞固定轨道，按 Minimal-Crossing 排序在 `[free_min, free_max]` 内居中均匀摊开；当可动线与只读固定线坐标差 `< nudge_distance - 1e-3` 且区间重叠时，固定线纹丝不动，可动线按**最小交叉优先 + 距原坐标最近 + 与全部重叠固定线/已放轨道间距 `>= nudge_distance`** 的准则落位至空闲轨道。
-4. **安全净宽夹紧 + 逐线全局复验回滚**：通过 `SpatialGridIndex::Query` 找出同跨度左右/上下障碍物膨胀框及相邻拐点约束得到安全通道 `[free_min, free_max]`（空间极窄不足 `2 * nudge_distance` 时自动选择最大净空子隙中心）；每条调整后走 `ValidateAndSimplifyRoute()` 全量碰撞与正交复验，若任一线冲突仅单线回滚，**100% 保留原有 `Valid` 合法率**。
+   * 交互拖拽与局部编辑（`RerouteAffected`、`RouteConnector`、`AutoRouteConnectors` 及 `AsyncLocalRouter::Poll` 局部收口，`full_graph = false`）：仅本次重算且未锁定（`!user_modified`）的直连线集为 `mutable_conns`；`CollectParticipants()` **不再拼合整条路由的二维大 `union_box`**，而是按确定性升序 `Id` 遍历 `mutable_conns` 中 `Status::kValid && points.size() >= 4` 连线的各可移动中间段 `[1, pts.size() - 3]`，沿线段外扩 `max(2 * nudge_distance, 80.0)` 执行窄条空间查询（局部紧凑短段簇 `<= 32` 格合并一次 `Query()`，跨区短段按 `8` 条、超长段 `> 600 px` 按 `4` 条分批 `QueryUnion()`，达到参与上限 `cap = max(256, selected.size())` 即早停；仅收集不足 `16` 条时回退补查起止端点及邻接块）。查询到的邻近非关联连线及所有 `user_modified == true` 连线**仅作为只读占用轨道（Fixed Anchors）参与冲突检测与避让**，确保拖拽时非关联线与手调线 100% 静止。
+2. **中间段与电气网表语义（`NetKey`）**：仅平移 `pts.size() >= 4` 连线的中间正交段（索引 `[1, pts.size() - 3]`），绝不篡改起止引脚位置与出线方向；按 `NetKey { src_block, src_pin }` 归组——**同一源引脚扇出允许共享主干，不同 `NetKey` 独立信号强制分轨**（同源固定线已存在时新扇出优先锚定其主干）。增量模式下若整个坐标带或冲突簇内不含可移动线段，直接整段跳过。
+3. **坐标带分桶 + 区间冲突聚类 + 固定轨道避让分配**：分别处理垂直与水平中间段；冷启动按 `<= 1.5 px` 聚合共线坐标带，交互态按 `< nudge_distance` 收集冲突簇。若簇内均为可动线且不撞固定轨道，按 Minimal-Crossing 排序在 `[free_min, free_max]` 内居中均匀摊开；当可动线与只读固定线坐标差 `< nudge_distance - 1e-3` 且区间重叠时，固定线纹丝不动，可动线通过 `PickNearestFreeTrack()` 预过滤垂直相交横向锚点（`cross_anchors`）、将候选轨道按 `(displacement, coord)` 升序去重后搜索（命中首个净空且零交叉轨道即早停），落位至空闲轨道。
+4. **安全净宽夹紧 + 局部 3 段增量复验与回滚**：通过 `SpatialGridIndex::Query` 找出同跨度左右/上下障碍物膨胀框及相邻拐点约束得到安全通道 `[free_min, free_max]`（空间极窄不足 `2 * nudge_distance` 时自动选择最大净空子隙中心）；对单一中间段非退化平移（`e_end - e_start == 1` 且相邻段无零长退化）优先调用 **`LocalOrthogonalRouter::ValidateNudgedMiddleSegment()`**，仅复验实际变更的相邻 3 段（`seg_idx - 1`、`seg_idx`、`seg_idx + 1`）的正交性、引脚出线方向与全局障碍碰撞（在首末段直接复用同一次 `index_.Query` 扫描计算 `src_buf`/`dst_buf`，其余端按需延迟查表保持完整窄缝缓冲语义），多段并移或退化时才回退 `ValidateAndSimplifyRoute()`；若任一线冲突仅单线回滚，**100% 保留原有 `Valid` 合法率**。
 
 ### 3.5 异步会话模型（`AsyncLocalRouter`）
 
@@ -280,9 +280,10 @@ localroute::LocalOrthogonalRouter router(cfg, std::make_shared<CustomSolver>());
 
 | 场景（10,000 模块 / 20,000 连线） | 指标 | 实测表现 |
 | :--- | :--- | :--- |
-| 同步 4 线程全图冷启动 | 总耗时 / 合法率 | **2.54 s**（`2540.68 ms`） / **99.53%**（19,906 Valid, 94 DisplayOnly, 0 Failed） |
-| 同步单模块拖拽（200 帧） | P50 / P99 | **0.393 ms** / **4.432 ms**（非关联线误提交 0） |
-| 同步 20 模块框选拖拽（200 帧） | P50 / P99 | **1.763 ms** / **4.741 ms** |
-| 同步穿插密集连线区（200 帧） | P50 / P99 | **0.699 ms** / **9.662 ms**（P95 `2.713 ms`，非关联线误提交 0） |
+| 同步 4 线程全图冷启动（`D_cold`） | 总耗时 / 合法率 | **2.42 s**（两次独立实测 `2415.96 ~ 2722.82 ms`） / **99.53%**（19,906 Valid, 94 DisplayOnly, 0 Failed） |
+| 同步单长线局部拖拽（`D_drag`，10 帧） | P50 / P99 | **0.298 ~ 0.560 ms** / **0.728 ~ 1.341 ms**（优化前 `0.680 ms` / `2.431 ms`） |
+| 同步单模块拖拽（`A`，200 帧） | P50 / P99 | **0.338 ~ 0.359 ms** / **4.649 ~ 5.094 ms**（mean `0.546 ~ 0.551 ms`，非关联线误提交 0） |
+| 同步 20 模块框选拖拽（`B20`，200 帧） | P50 / P99 | **1.303 ~ 1.461 ms** / **4.818 ~ 11.612 ms**（mean `1.630 ~ 2.145 ms`） |
+| 同步穿插密集连线区（`C`，200 帧） | P50 / P99 | **0.619 ~ 0.646 ms** / **2.611 ~ 3.530 ms**（P95 `1.477 ~ 1.771 ms`，非关联线误提交 0） |
 | `qt_demo` Async 10k 交互冒烟（含焊点+跳线弧） | `Route Time` / `Paint Time` | **0.021 ~ 0.056 ms** / **6.41 ~ 8.38 ms** |
 | `qt_demo` Sync 10k 局部渲染（含焊点+跳线弧） | `Paint Time` | **8.87 ~ 9.27 ms** |
