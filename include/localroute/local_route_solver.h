@@ -74,8 +74,8 @@ struct Config {
   double padding = 250.0;
   double buffer = 8.0;
   double penalty = 50.0;
-  double nudge_distance = 10.0;
-  double max_nudge_distance = 24.0;
+  double nudge_distance = 12.0;
+  double max_nudge_distance = 36.0;
   unsigned retries = 3;
   unsigned budget = 120;
   bool settle_nudge = false;

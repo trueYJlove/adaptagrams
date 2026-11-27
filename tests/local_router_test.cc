@@ -1034,8 +1034,8 @@ void TestChannelNudgingElasticSpacing() {
   CHECK(threw);
 
   const Config cfg;
-  CHECK(cfg.nudge_distance == 10.0);
-  CHECK(cfg.max_nudge_distance == 24.0);
+  CHECK(cfg.nudge_distance == 12.0);
+  CHECK(cfg.max_nudge_distance == 36.0);
 
   auto run_bundle = [&](double b2_left) {
     LocalOrthogonalRouter r(cfg);
@@ -1090,14 +1090,23 @@ void TestChannelNudgingElasticSpacing() {
   CHECK(narrow_min > 4.0);
   CHECK(narrow_max < cfg.nudge_distance);
 
-  // Wide corridor (600 px gap): elastically expands strictly to
-  // max_nudge_distance (24 px) with 0 overlaps and 0 crossings.
-  const std::vector<double> wide_gaps = run_bundle(680.0);
+  // Mid-wide corridor (600 px gap -> avail ~583.9, step ~29.2): elastically
+  // expands > nudge_distance and < max_nudge_distance.
+  const std::vector<double> mid_gaps = run_bundle(680.0);
+  const double mid_min = *std::min_element(mid_gaps.begin(), mid_gaps.end());
+  const double mid_max = *std::max_element(mid_gaps.begin(), mid_gaps.end());
+  CHECK(mid_min > cfg.nudge_distance + 1.0);
+  CHECK(mid_max < cfg.max_nudge_distance);
+  CHECK(mid_min > narrow_max);
+
+  // Extra-wide corridor (800 px gap -> avail ~783.9): elastically expands
+  // strictly to max_nudge_distance (36 px) with 0 overlaps and 0 crossings.
+  const std::vector<double> wide_gaps = run_bundle(880.0);
   const double wide_min = *std::min_element(wide_gaps.begin(), wide_gaps.end());
   const double wide_max = *std::max_element(wide_gaps.begin(), wide_gaps.end());
   CHECK(std::abs(wide_min - cfg.max_nudge_distance) <= 1e-3);
   CHECK(std::abs(wide_max - cfg.max_nudge_distance) <= 1e-3);
-  CHECK(wide_min > narrow_max);
+  CHECK(wide_min > mid_max);
 }
 
 }  // namespace

@@ -620,7 +620,9 @@ void NudgeAxis(
                                           0.5 * cfg.max_nudge_distance + 0.5) -
                                      1e-3);
   const double max_band_span =
-      full_graph ? 2.5 : std::max(16.0, cfg.nudge_distance * 4.0);
+      full_graph ? 2.5
+                 : std::max(16.0, std::max(cfg.nudge_distance * 4.0,
+                                           cfg.max_nudge_distance * 1.1));
   for (std::size_t b_start = 0; b_start < all_segs.size();) {
     const double anchor = all_segs[b_start].coord;
     std::size_t b_end = b_start + 1;
