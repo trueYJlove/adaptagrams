@@ -1055,8 +1055,62 @@ void LocalOrthogonalRouter::MarkConnector(Id id) {
   Mark(id);
 }
 
+std::vector<Id> LocalOrthogonalRouter::UpdateBlockPins(
+    Id block_id, Rect new_rect, std::vector<Pin> new_pins) {
+  (void)blocks_.at(block_id);
+  CheckBox(new_rect);
+  index_.Check(new_rect);
+  std::set<Id> seen;
+  for (const auto& p : new_pins) {
+    if (!p.id || p.id == 2147483647u ||
+        !(p.x >= 0.0 && p.x <= 1.0 && p.y >= 0.0 && p.y <= 1.0) || !p.dirs ||
+        (p.dirs & ~15u) || !seen.insert(p.id).second) {
+      throw std::invalid_argument("invalid pin");
+    }
+  }
+
+  index_.Update(block_id, new_rect);
+  Block& blk = blocks_.at(block_id);
+  blk.rect = new_rect;
+  blk.pins = std::move(new_pins);
+
+  std::vector<Id> adj;
+  if (const auto ait = adjacent_.find(block_id); ait != adjacent_.end()) {
+    adj = ait->second;
+  }
+  std::vector<Id> surviving;
+  surviving.reserve(adj.size());
+  for (Id cid : adj) {
+    const auto cit = conns_.find(cid);
+    if (cit == conns_.end()) {
+      continue;
+    }
+    const Conn& c = cit->second;
+    if ((c.src == block_id && !seen.count(c.sp)) ||
+        (c.dst == block_id && !seen.count(c.dp))) {
+      RemoveConnector(cid);
+    } else {
+      Mark(cid);
+      surviving.push_back(cid);
+    }
+  }
+  if (cfg_.reroute_third_party_blocked) {
+    InvalidateObstacle(block_id, new_rect);
+  }
+  std::sort(surviving.begin(), surviving.end());
+  surviving.erase(std::unique(surviving.begin(), surviving.end()),
+                  surviving.end());
+  return surviving;
+}
+
+void LocalOrthogonalRouter::RestoreRoute(Id conn_id, Route route) {
+  (void)conns_.at(conn_id);
+  Publish(conn_id, std::move(route));
+}
+
 bool LocalOrthogonalRouter::MoveRouteSegment(Id conn_id, std::size_t seg_index,
-                                             double new_coord) {
+                                             double new_coord,
+                                             std::vector<Id>* changed_out) {
   if (!std::isfinite(new_coord)) {
     return false;
   }
@@ -1066,151 +1120,269 @@ bool LocalOrthogonalRouter::MoveRouteSegment(Id conn_id, std::size_t seg_index,
       rit->second.points.size() < 2) {
     return false;
   }
-  const Conn& conn = cit->second;
-  const auto& src = blocks_.at(conn.src);
-  const auto& dst = blocks_.at(conn.dst);
-  const Pin sp = FindPin(src, conn.sp);
-  const Pin dp = FindPin(dst, conn.dp);
-  const Point a = PinPosition(src.rect, sp);
-  const Point b = PinPosition(dst.rect, dp);
-  const std::vector<Point>& old_pts = rit->second.points;
-  if (seg_index + 1 >= old_pts.size()) {
+  const Conn base_conn = cit->second;
+  const std::vector<Point>& base_pts = rit->second.points;
+  if (seg_index + 1 >= base_pts.size()) {
     return false;
   }
-  const Point u = old_pts[seg_index];
-  const Point v = old_pts[seg_index + 1];
-  const unsigned dir = OrthoDir(u, v);
-  if (!dir) {
+  const Point base_u = base_pts[seg_index];
+  const Point base_v = base_pts[seg_index + 1];
+  const unsigned base_dir = OrthoDir(base_u, base_v);
+  if (!base_dir) {
     return false;
   }
-  const bool is_vert = (dir & (kUp | kDown)) != 0;
-  std::vector<Point> cand;
+  const bool base_is_vert = (base_dir & (kUp | kDown)) != 0;
+  const double old_coord = base_is_vert ? base_u.x : base_u.y;
+  const double base_k0 = std::min(base_is_vert ? base_u.y : base_u.x,
+                                  base_is_vert ? base_v.y : base_v.x);
+  const double base_k1 = std::max(base_is_vert ? base_u.y : base_u.x,
+                                  base_is_vert ? base_v.y : base_v.x);
+  const double base_split_coord = 0.5 * (base_k0 + base_k1);
+  const bool base_is_end_split =
+      (base_pts.size() > 2) &&
+      (seg_index == 0 || seg_index + 2 == base_pts.size());
 
-  if (old_pts.size() >= 4 && seg_index >= 1 && seg_index + 2 < old_pts.size()) {
-    cand = old_pts;
-    if (is_vert) {
-      cand[seg_index].x = new_coord;
-      cand[seg_index + 1].x = new_coord;
-    } else {
-      cand[seg_index].y = new_coord;
-      cand[seg_index + 1].y = new_coord;
-    }
-  } else if (old_pts.size() == 2) {
-    if (is_vert) {
-      if ((sp.dirs & (kLeft | kRight)) && (dp.dirs & (kLeft | kRight))) {
-        cand = {a, {new_coord, a.y}, {new_coord, b.y}, b};
-      } else {
-        const double span = std::abs(b.y - a.y);
-        double y_exit = a.y;
-        double y_enter = b.y;
-        if (b.y > a.y + 4.0 && (sp.dirs & kDown) && (dp.dirs & kUp)) {
-          const double stub = std::min(20.0, std::max(2.0, span * 0.25));
-          y_exit = a.y + stub;
-          y_enter = b.y - stub;
-        } else if (a.y > b.y + 4.0 && (sp.dirs & kUp) && (dp.dirs & kDown)) {
-          const double stub = std::min(20.0, std::max(2.0, span * 0.25));
-          y_exit = a.y - stub;
-          y_enter = b.y + stub;
-        } else {
-          const double stub = std::max(cfg_.buffer + 4.0, 12.0);
-          y_exit = a.y + ((sp.dirs & kUp) && !(sp.dirs & kDown) ? -stub : stub);
-          y_enter =
-              b.y + ((dp.dirs & kDown) && !(dp.dirs & kUp) ? stub : -stub);
-        }
-        cand = {a,
-                {a.x, y_exit},
-                {new_coord, y_exit},
-                {new_coord, y_enter},
-                {b.x, y_enter},
-                b};
+  // Collect same-(src, sp) fan-out siblings sharing a collinear overlapping
+  // segment so shared trunks move together and keep solder joints intact.
+  struct SiblingSeg {
+    Id cid = 0;
+    std::size_t seg_idx = 0;
+    bool is_end_split = false;
+  };
+  std::vector<SiblingSeg> siblings;
+  if (const auto ait = adjacent_.find(base_conn.src); ait != adjacent_.end()) {
+    for (Id sib_id : ait->second) {
+      if (sib_id == conn_id) {
+        continue;
       }
-    } else {
-      if ((sp.dirs & (kUp | kDown)) && (dp.dirs & (kUp | kDown))) {
-        cand = {a, {a.x, new_coord}, {b.x, new_coord}, b};
-      } else {
-        const double span = std::abs(b.x - a.x);
-        double x_exit = a.x;
-        double x_enter = b.x;
-        if (b.x > a.x + 4.0 && (sp.dirs & kRight) && (dp.dirs & kLeft)) {
-          const double stub = std::min(20.0, std::max(2.0, span * 0.25));
-          x_exit = a.x + stub;
-          x_enter = b.x - stub;
-        } else if (a.x > b.x + 4.0 && (sp.dirs & kLeft) && (dp.dirs & kRight)) {
-          const double stub = std::min(20.0, std::max(2.0, span * 0.25));
-          x_exit = a.x - stub;
-          x_enter = b.x + stub;
-        } else {
-          const double stub = std::max(cfg_.buffer + 4.0, 12.0);
-          x_exit =
-              a.x + ((sp.dirs & kLeft) && !(sp.dirs & kRight) ? -stub : stub);
-          x_enter =
-              b.x + ((dp.dirs & kRight) && !(dp.dirs & kLeft) ? stub : -stub);
+      const auto scit = conns_.find(sib_id);
+      const auto srit = routes_.find(sib_id);
+      if (scit == conns_.end() || srit == routes_.end() ||
+          scit->second.src != base_conn.src ||
+          scit->second.sp != base_conn.sp || srit->second.points.size() < 2) {
+        continue;
+      }
+      const auto& spts = srit->second.points;
+      bool found_seg = false;
+      std::size_t best_j = 0;
+      bool best_mid = false;
+      double best_ov = 0.0;
+      for (std::size_t j = 0; j + 1 < spts.size(); ++j) {
+        const unsigned sdir = OrthoDir(spts[j], spts[j + 1]);
+        if (!sdir) {
+          continue;
         }
-        cand = {a,
-                {x_exit, a.y},
-                {x_exit, new_coord},
-                {x_enter, new_coord},
-                {x_enter, b.y},
-                b};
+        const bool s_vert = (sdir & (kUp | kDown)) != 0;
+        if (s_vert != base_is_vert) {
+          continue;
+        }
+        const double sc = s_vert ? spts[j].x : spts[j].y;
+        if (std::abs(sc - old_coord) > 1e-3) {
+          continue;
+        }
+        const double sk0 = std::min(s_vert ? spts[j].y : spts[j].x,
+                                    s_vert ? spts[j + 1].y : spts[j + 1].x);
+        const double sk1 = std::max(s_vert ? spts[j].y : spts[j].x,
+                                    s_vert ? spts[j + 1].y : spts[j + 1].x);
+        const double ov = std::min(base_k1, sk1) - std::max(base_k0, sk0);
+        if (ov > 1e-3) {
+          const bool is_mid =
+              (spts.size() >= 4 && j >= 1 && j + 2 < spts.size());
+          if (!found_seg || (is_mid && !best_mid) ||
+              (is_mid == best_mid && ov > best_ov)) {
+            found_seg = true;
+            best_j = j;
+            best_mid = is_mid;
+            best_ov = ov;
+          }
+        }
+      }
+      if (found_seg) {
+        const bool sib_end_split =
+            (spts.size() > 2) && (best_j == 0 || best_j + 2 == spts.size());
+        siblings.push_back({sib_id, best_j, sib_end_split});
       }
     }
-  } else if (seg_index == 0) {
-    cand.push_back(old_pts.front());
-    if (is_vert) {
-      const double split_y = 0.5 * (u.y + v.y);
-      cand.push_back({u.x, split_y});
-      cand.push_back({new_coord, split_y});
-      cand.push_back({new_coord, v.y});
-    } else {
-      const double split_x = 0.5 * (u.x + v.x);
-      cand.push_back({split_x, u.y});
-      cand.push_back({split_x, new_coord});
-      cand.push_back({v.x, new_coord});
-    }
-    for (std::size_t k = 2; k < old_pts.size(); ++k) {
-      cand.push_back(old_pts[k]);
-    }
-  } else {
-    for (std::size_t k = 0; k + 2 < old_pts.size(); ++k) {
-      cand.push_back(old_pts[k]);
-    }
-    if (is_vert) {
-      const double split_y = 0.5 * (u.y + v.y);
-      cand.push_back({new_coord, u.y});
-      cand.push_back({new_coord, split_y});
-      cand.push_back({v.x, split_y});
-    } else {
-      const double split_x = 0.5 * (u.x + v.x);
-      cand.push_back({u.x, new_coord});
-      cand.push_back({split_x, new_coord});
-      cand.push_back({split_x, v.y});
-    }
-    cand.push_back(old_pts.back());
   }
 
-  cand = SimplifyOrtho(std::move(cand));
-  if (cand.size() < 2) {
-    return false;
-  }
-  for (std::size_t j = 1; j < cand.size(); ++j) {
-    if (!OrthoDir(cand[j - 1], cand[j])) {
+  auto apply_move_one = [&](Id target_cid, std::size_t target_seg_idx,
+                            bool has_split_override,
+                            double split_override) -> bool {
+    const auto t_cit = conns_.find(target_cid);
+    const auto t_rit = routes_.find(target_cid);
+    if (t_cit == conns_.end() || t_rit == routes_.end() ||
+        t_rit->second.points.size() < 2) {
       return false;
     }
-  }
+    const Conn& conn = t_cit->second;
+    const auto& src = blocks_.at(conn.src);
+    const auto& dst = blocks_.at(conn.dst);
+    const Pin sp = FindPin(src, conn.sp);
+    const Pin dp = FindPin(dst, conn.dp);
+    const Point a = PinPosition(src.rect, sp);
+    const Point b = PinPosition(dst.rect, dp);
+    const std::vector<Point>& old_pts = t_rit->second.points;
+    if (target_seg_idx + 1 >= old_pts.size()) {
+      return false;
+    }
+    const Point u = old_pts[target_seg_idx];
+    const Point v = old_pts[target_seg_idx + 1];
+    const unsigned dir = OrthoDir(u, v);
+    if (!dir) {
+      return false;
+    }
+    const bool is_vert = (dir & (kUp | kDown)) != 0;
+    std::vector<Point> cand;
 
-  Route updated = rit->second;
-  updated.method = RouteMethod::kReuse;
-  updated.user_modified = true;
-  updated.outcome = Outcome::kNone;
-  std::vector<Point> validated = cand;
-  if (ValidateAndSimplifyRoute(conn, &validated)) {
-    updated.points = std::move(validated);
-    updated.status = Status::kValid;
-  } else {
-    updated.points = std::move(cand);
-    updated.status = Status::kDisplayOnly;
+    if (old_pts.size() >= 4 && target_seg_idx >= 1 &&
+        target_seg_idx + 2 < old_pts.size()) {
+      cand = old_pts;
+      if (is_vert) {
+        cand[target_seg_idx].x = new_coord;
+        cand[target_seg_idx + 1].x = new_coord;
+      } else {
+        cand[target_seg_idx].y = new_coord;
+        cand[target_seg_idx + 1].y = new_coord;
+      }
+    } else if (old_pts.size() == 2) {
+      if (is_vert) {
+        if ((sp.dirs & (kLeft | kRight)) && (dp.dirs & (kLeft | kRight))) {
+          cand = {a, {new_coord, a.y}, {new_coord, b.y}, b};
+        } else {
+          const double span = std::abs(b.y - a.y);
+          double y_exit = a.y;
+          double y_enter = b.y;
+          if (b.y > a.y + 4.0 && (sp.dirs & kDown) && (dp.dirs & kUp)) {
+            const double stub = std::min(20.0, std::max(2.0, span * 0.25));
+            y_exit = a.y + stub;
+            y_enter = b.y - stub;
+          } else if (a.y > b.y + 4.0 && (sp.dirs & kUp) && (dp.dirs & kDown)) {
+            const double stub = std::min(20.0, std::max(2.0, span * 0.25));
+            y_exit = a.y - stub;
+            y_enter = b.y + stub;
+          } else {
+            const double stub = std::max(cfg_.buffer + 4.0, 12.0);
+            y_exit =
+                a.y + ((sp.dirs & kUp) && !(sp.dirs & kDown) ? -stub : stub);
+            y_enter =
+                b.y + ((dp.dirs & kDown) && !(dp.dirs & kUp) ? stub : -stub);
+          }
+          cand = {a,
+                  {a.x, y_exit},
+                  {new_coord, y_exit},
+                  {new_coord, y_enter},
+                  {b.x, y_enter},
+                  b};
+        }
+      } else {
+        if ((sp.dirs & (kUp | kDown)) && (dp.dirs & (kUp | kDown))) {
+          cand = {a, {a.x, new_coord}, {b.x, new_coord}, b};
+        } else {
+          const double span = std::abs(b.x - a.x);
+          double x_exit = a.x;
+          double x_enter = b.x;
+          if (b.x > a.x + 4.0 && (sp.dirs & kRight) && (dp.dirs & kLeft)) {
+            const double stub = std::min(20.0, std::max(2.0, span * 0.25));
+            x_exit = a.x + stub;
+            x_enter = b.x - stub;
+          } else if (a.x > b.x + 4.0 && (sp.dirs & kLeft) &&
+                     (dp.dirs & kRight)) {
+            const double stub = std::min(20.0, std::max(2.0, span * 0.25));
+            x_exit = a.x - stub;
+            x_enter = b.x + stub;
+          } else {
+            const double stub = std::max(cfg_.buffer + 4.0, 12.0);
+            x_exit =
+                a.x + ((sp.dirs & kLeft) && !(sp.dirs & kRight) ? -stub : stub);
+            x_enter =
+                b.x + ((dp.dirs & kRight) && !(dp.dirs & kLeft) ? stub : -stub);
+          }
+          cand = {a,
+                  {x_exit, a.y},
+                  {x_exit, new_coord},
+                  {x_enter, new_coord},
+                  {x_enter, b.y},
+                  b};
+        }
+      }
+    } else if (target_seg_idx == 0) {
+      cand.push_back(old_pts.front());
+      if (is_vert) {
+        const double split_y =
+            has_split_override ? split_override : 0.5 * (u.y + v.y);
+        cand.push_back({u.x, split_y});
+        cand.push_back({new_coord, split_y});
+        cand.push_back({new_coord, v.y});
+      } else {
+        const double split_x =
+            has_split_override ? split_override : 0.5 * (u.x + v.x);
+        cand.push_back({split_x, u.y});
+        cand.push_back({split_x, new_coord});
+        cand.push_back({v.x, new_coord});
+      }
+      for (std::size_t k = 2; k < old_pts.size(); ++k) {
+        cand.push_back(old_pts[k]);
+      }
+    } else {
+      for (std::size_t k = 0; k + 2 < old_pts.size(); ++k) {
+        cand.push_back(old_pts[k]);
+      }
+      if (is_vert) {
+        const double split_y =
+            has_split_override ? split_override : 0.5 * (u.y + v.y);
+        cand.push_back({new_coord, u.y});
+        cand.push_back({new_coord, split_y});
+        cand.push_back({v.x, split_y});
+      } else {
+        const double split_x =
+            has_split_override ? split_override : 0.5 * (u.x + v.x);
+        cand.push_back({u.x, new_coord});
+        cand.push_back({split_x, new_coord});
+        cand.push_back({split_x, v.y});
+      }
+      cand.push_back(old_pts.back());
+    }
+
+    cand = SimplifyOrtho(std::move(cand));
+    if (cand.size() < 2) {
+      return false;
+    }
+    for (std::size_t j = 1; j < cand.size(); ++j) {
+      if (!OrthoDir(cand[j - 1], cand[j])) {
+        return false;
+      }
+    }
+
+    Route updated = t_rit->second;
+    updated.method = RouteMethod::kReuse;
+    updated.user_modified = true;
+    updated.outcome = Outcome::kNone;
+    std::vector<Point> validated = cand;
+    if (ValidateAndSimplifyRoute(conn, &validated)) {
+      updated.points = std::move(validated);
+      updated.status = Status::kValid;
+    } else {
+      updated.points = std::move(cand);
+      updated.status = Status::kDisplayOnly;
+    }
+    Publish(target_cid, std::move(updated));
+    return true;
+  };
+
+  if (!apply_move_one(conn_id, seg_index, false, 0.0)) {
+    return false;
   }
-  Publish(conn_id, std::move(updated));
+  if (changed_out) {
+    changed_out->clear();
+    changed_out->push_back(conn_id);
+  }
+  for (const SiblingSeg& sib : siblings) {
+    const bool share_split = base_is_end_split && sib.is_end_split;
+    if (apply_move_one(sib.cid, sib.seg_idx, share_split, base_split_coord) &&
+        changed_out) {
+      changed_out->push_back(sib.cid);
+    }
+  }
   return true;
 }
 

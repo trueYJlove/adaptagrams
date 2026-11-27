@@ -43,6 +43,10 @@ if(LOCALROUTE_BUILD_TESTS)
         ManualSegmentDragAndPreserve
         AutoRouteSelectedLines
         WireCongestionSoftPenalty
+        UpdateBlockPinsPreservesValidWires
+        AsyncIncrementalTopoFifoOrder
+        AsyncViewportPriorityNudge
+        SharedTrunkSegmentDragNoNeighborPush
     )
         add_test(NAME local.${t} COMMAND test_unit ${t})
     endforeach()

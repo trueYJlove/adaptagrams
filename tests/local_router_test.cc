@@ -841,6 +841,186 @@ void TestWireCongestionSoftPenalty() {
   CHECK(mean_mid_y(shared_pts) < 110.0);
 }
 
+void TestUpdateBlockPinsPreservesValidWires() {
+  Config cfg;
+  cfg.buffer = 6.0;
+  LocalOrthogonalRouter r(cfg);
+  r.AddBlock({1,
+              {0.0, 0.0, 80.0, 80.0},
+              {{1, 1.0, 0.3, kRight}, {2, 1.0, 0.7, kRight}}});
+  r.AddBlock({2,
+              {280.0, 40.0, 360.0, 120.0},
+              {{10, 0.0, 0.3, kLeft}, {11, 0.0, 0.7, kLeft}}});
+  r.AddConnector({1, 1, 1, 2, 10});
+  r.AddConnector({2, 1, 2, 2, 11});
+  r.RouteAllParallel(1);
+
+  CHECK(r.MoveRouteSegment(1, 1, 220.0));
+  CHECK(r.route(1).user_modified);
+
+  const std::vector<Id> surviving =
+      r.UpdateBlockPins(1, {0.0, 0.0, 80.0, 80.0}, {{1, 1.0, 0.4, kRight}});
+  CHECK(surviving == std::vector<Id>{1});
+  CHECK(!r.all_conns().count(2));
+  CHECK(r.all_conns().count(1));
+  CHECK(r.route(1).user_modified);
+
+  (void)r.RerouteAffected({1});
+  CHECK(r.route(1).status == Status::kValid);
+  CHECK(r.route(1).user_modified);
+  CHECK(r.route(1).points.size() >= 4);
+  CHECK(std::abs(r.route(1).points[1].x - 220.0) <= 1e-6);
+}
+
+void TestAsyncIncrementalTopoFifoOrder() {
+  Config cfg;
+  cfg.buffer = 6.0;
+  LocalOrthogonalRouter initial(cfg);
+  initial.AddBlock({1, {0.0, 0.0, 80.0, 60.0}, {{1, 1.0, 0.5, kRight}}});
+  initial.AddBlock({2, {240.0, 20.0, 320.0, 80.0}, {{2, 0.0, 0.5, kLeft}}});
+  initial.AddConnector({1, 1, 1, 2, 2});
+
+  AsyncLocalRouter async_router(std::move(initial));
+  async_router.StartAll();
+  // Interleave Move -> AddBlock -> AddConnector -> Move -> UpdateBlockPins ->
+  // RemoveBlock strictly in order while the worker thread runs.
+  async_router.Move({{1, {0.0, 40.0, 80.0, 100.0}}});
+  async_router.AddBlock(
+      {3, {0.0, 160.0, 80.0, 220.0}, {{1, 1.0, 0.5, kRight}}});
+  async_router.AddBlock(
+      {4, {240.0, 200.0, 320.0, 260.0}, {{2, 0.0, 0.5, kLeft}}});
+  async_router.AddConnector({2, 3, 1, 4, 2});
+  async_router.Move({{3, {20.0, 180.0, 100.0, 240.0}}});
+  (void)async_router.UpdateBlockPins(
+      1, {0.0, 50.0, 80.0, 110.0},
+      {{1, 1.0, 0.5, kRight}, {9, 0.0, 0.5, kLeft}});
+  async_router.RemoveBlock(2);
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (async_router.PendingCount() > 0) {
+    CHECK(std::chrono::steady_clock::now() < deadline);
+    if (!async_router.Poll(32)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+  async_router.Poll(32);
+
+  const auto& v = async_router.view();
+  CHECK(!v.all_blocks().count(2));
+  CHECK(!v.all_conns().count(1));
+  CHECK(v.all_blocks().count(1) && std::abs(v.block(1).rect.t - 50.0) <= 1e-6);
+  CHECK(v.all_blocks().count(3) && std::abs(v.block(3).rect.l - 20.0) <= 1e-6);
+  CHECK(v.all_conns().count(2));
+  CHECK(v.route(2).status == Status::kValid);
+  CHECK(std::abs(v.route(2).points.front().x - 100.0) <= 1e-6);
+}
+
+void TestAsyncViewportPriorityNudge() {
+  Config cfg;
+  cfg.buffer = 6.0;
+  cfg.nudge_distance = 8.0;
+  cfg.enable_channel_nudging = true;
+  LocalOrthogonalRouter initial(cfg);
+
+  // Two visible parallel stacked routes inside viewport [0, 500]^2 with
+  // overlapping vertical spans [45, 145] and [85, 185].
+  initial.AddBlock({1, {0.0, 20.0, 80.0, 70.0}, {{1, 1.0, 0.5, kRight}}});
+  initial.AddBlock({2, {320.0, 120.0, 400.0, 170.0}, {{2, 0.0, 0.5, kLeft}}});
+  initial.AddBlock({3, {0.0, 60.0, 80.0, 110.0}, {{1, 1.0, 0.5, kRight}}});
+  initial.AddBlock({4, {320.0, 160.0, 400.0, 210.0}, {{2, 0.0, 0.5, kLeft}}});
+  initial.AddConnector({1, 1, 1, 2, 2});
+  initial.AddConnector({2, 3, 1, 4, 2});
+
+  // 250 offscreen blocks/wires far away so StartAll() spans multiple batches.
+  Id next_bid = 100;
+  Id next_cid = 100;
+  for (int i = 0; i < 250; ++i) {
+    const double y = static_cast<double>(i) * 120.0;
+    const Id s = next_bid++;
+    const Id d = next_bid++;
+    initial.AddBlock(
+        {s, {4000.0, y, 4080.0, y + 50.0}, {{1, 1.0, 0.5, kRight}}});
+    initial.AddBlock(
+        {d, {4300.0, y + 40.0, 4380.0, y + 90.0}, {{2, 0.0, 0.5, kLeft}}});
+    initial.AddConnector({next_cid++, s, 1, d, 2});
+  }
+
+  AsyncLocalRouter async_router(std::move(initial));
+  async_router.Prioritize({-50.0, -50.0, 500.0, 400.0});
+  async_router.StartAll();
+
+  bool verified_early_nudge = false;
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (async_router.PendingCount() > 0) {
+    CHECK(std::chrono::steady_clock::now() < deadline);
+    if (!async_router.Poll(8)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      continue;
+    }
+    const auto& v = async_router.view();
+    if (v.route(1).status == Status::kValid &&
+        v.route(2).status == Status::kValid &&
+        async_router.PendingCount() > 0) {
+      CHECK(v.route(1).points.size() >= 4);
+      CHECK(v.route(2).points.size() >= 4);
+      const double gap =
+          std::abs(v.route(1).points[1].x - v.route(2).points[1].x);
+      CHECK(gap >= 4.0);
+      verified_early_nudge = true;
+      break;
+    }
+  }
+  CHECK(verified_early_nudge);
+}
+
+void TestSharedTrunkSegmentDragNoNeighborPush() {
+  Config cfg;
+  cfg.buffer = 6.0;
+  cfg.nudge_distance = 8.0;
+  LocalOrthogonalRouter r(cfg);
+  // Same-source fan-out from block 8 pin 200 to blocks 11 and 12 (conns 3 & 4).
+  r.AddBlock({8, {0.0, 80.0, 90.0, 130.0}, {{200, 1.0, 0.5, kRight}}});
+  r.AddBlock({11, {270.0, 160.0, 360.0, 210.0}, {{100, 0.0, 0.5, kLeft}}});
+  r.AddBlock({12, {270.0, 240.0, 360.0, 290.0}, {{100, 0.0, 0.5, kLeft}}});
+  r.AddConnector({3, 8, 200, 11, 100});
+  r.AddConnector({4, 8, 200, 12, 100});
+
+  // Unrelated nearby wire within nudge_distance of target x=210.
+  r.AddBlock({20, {0.0, 0.0, 90.0, 50.0}, {{200, 1.0, 0.5, kRight}}});
+  r.AddBlock({21, {334.0, 120.0, 424.0, 170.0}, {{100, 0.0, 0.5, kLeft}}});
+  r.AddConnector({99, 20, 200, 21, 100});
+
+  r.RouteAllParallel(1);
+  CHECK(r.route(3).status == Status::kValid && r.route(3).points.size() == 4);
+  CHECK(r.route(4).status == Status::kValid && r.route(4).points.size() == 4);
+  CHECK(std::abs(r.route(3).points[1].x - r.route(4).points[1].x) <= 1e-6);
+  CHECK(r.route(99).status == Status::kValid);
+  const std::vector<Point> neighbor_before = r.route(99).points;
+
+  // Move conn 3's trunk segment to x = 210 (right next to neighbor conn 99 at
+  // x = 212): BOTH conn 3 and conn 4 follow together, solder joint remains,
+  // and neighbor conn 99 MUST NOT move!
+  std::vector<Id> changed;
+  CHECK(r.MoveRouteSegment(3, 1, 210.0, &changed));
+  CHECK(changed.size() == 2);
+  CHECK(std::abs(r.route(3).points[1].x - 210.0) <= 1e-6);
+  CHECK(std::abs(r.route(4).points[1].x - 210.0) <= 1e-6);
+  CHECK(r.route(3).user_modified && r.route(4).user_modified);
+  CHECK(!r.ComputeSolderJoints({3, 4}).empty());
+  CHECK(r.route(99).points == neighbor_before);
+
+  // Verify parity through AsyncLocalRouter::MoveRouteSegment.
+  AsyncLocalRouter async_router(std::move(r));
+  std::vector<Id> async_changed;
+  CHECK(async_router.MoveRouteSegment(3, 1, 215.0, &async_changed));
+  CHECK(async_changed.size() == 2);
+  CHECK(std::abs(async_router.view().route(3).points[1].x - 215.0) <= 1e-6);
+  CHECK(std::abs(async_router.view().route(4).points[1].x - 215.0) <= 1e-6);
+  CHECK(async_router.view().route(99).points == neighbor_before);
+}
+
 }  // namespace
 }  // namespace localroute
 
@@ -865,6 +1045,14 @@ int main(int argc, char** argv) {
        localroute::TestManualSegmentDragAndPreserve},
       {"AutoRouteSelectedLines", localroute::TestAutoRouteSelectedLines},
       {"WireCongestionSoftPenalty", localroute::TestWireCongestionSoftPenalty},
+      {"UpdateBlockPinsPreservesValidWires",
+       localroute::TestUpdateBlockPinsPreservesValidWires},
+      {"AsyncIncrementalTopoFifoOrder",
+       localroute::TestAsyncIncrementalTopoFifoOrder},
+      {"AsyncViewportPriorityNudge",
+       localroute::TestAsyncViewportPriorityNudge},
+      {"SharedTrunkSegmentDragNoNeighborPush",
+       localroute::TestSharedTrunkSegmentDragNoNeighborPush},
   };
   try {
     for (const auto& t : kCases) {

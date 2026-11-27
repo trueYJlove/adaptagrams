@@ -31,7 +31,11 @@ class LocalOrthogonalRouter {
   void RouteAllParallel(unsigned threads = 0);
   void RouteConnector(Id id);
   void MarkConnector(Id id);
-  bool MoveRouteSegment(Id conn_id, std::size_t seg_index, double new_coord);
+  std::vector<Id> UpdateBlockPins(Id block_id, Rect new_rect,
+                                  std::vector<Pin> new_pins);
+  void RestoreRoute(Id conn_id, Route route);
+  bool MoveRouteSegment(Id conn_id, std::size_t seg_index, double new_coord,
+                        std::vector<Id>* changed_out = nullptr);
   std::vector<Id> AutoRouteConnectors(const std::vector<Id>& conn_ids);
   std::vector<Point> ComputeSolderJoints(const std::vector<Id>& conn_ids) const;
   LocalOrthogonalRouter Clone() const { return *this; }
