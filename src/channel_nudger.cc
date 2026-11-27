@@ -366,9 +366,12 @@ void ComputeGroupFreeBounds(const Config& cfg, const SpatialGridIndex& index,
                             const std::unordered_map<Id, Block>& blocks,
                             Axis axis, const TrackGroup& group,
                             double search_span, double* free_min_out,
-                            double* free_max_out) {
+                            double* free_max_out,
+                            bool* bounded_both_out = nullptr) {
   double free_min = group.coord0 - search_span;
   double free_max = group.coord0 + search_span;
+  bool has_min_bound = false;
+  bool has_max_bound = false;
   const Rect query_box = (axis == Axis::kVertical)
                              ? Rect{group.coord0 - search_span - cfg.buffer,
                                     group.min_k - cfg.buffer,
@@ -390,31 +393,41 @@ void ComputeGroupFreeBounds(const Config& cfg, const SpatialGridIndex& index,
     const double b_max_p = (axis == Axis::kVertical) ? rb.r : rb.b;
     if (b_max_p <= group.coord0 + 1e-3) {
       free_min = std::max(free_min, b_max_p + 0.05);
+      has_min_bound = true;
     } else if (b_min_p >= group.coord0 - 1e-3) {
       free_max = std::min(free_max, b_min_p - 0.05);
+      has_max_bound = true;
     }
   }
 
   for (const MiddleSegment* s : group.segs) {
     if (s->prev_prim < s->coord - 1e-3) {
       free_min = std::max(free_min, s->prev_prim + 1.0);
+      has_min_bound = true;
     } else if (s->prev_prim > s->coord + 1e-3) {
       free_max = std::min(free_max, s->prev_prim - 1.0);
+      has_max_bound = true;
     }
     if (s->next_prim < s->coord - 1e-3) {
       free_min = std::max(free_min, s->next_prim + 1.0);
+      has_min_bound = true;
     } else if (s->next_prim > s->coord + 1e-3) {
       free_max = std::min(free_max, s->next_prim - 1.0);
+      has_max_bound = true;
     }
   }
 
   *free_min_out = free_min;
   *free_max_out = free_max;
+  if (bounded_both_out) {
+    *bounded_both_out = has_min_bound && has_max_bound;
+  }
 }
 
 double PickNearestFreeTrack(const Config& cfg, const TrackGroup& group,
                             double free_min, double free_max,
-                            const std::vector<TrackAnchor>& anchors) {
+                            const std::vector<TrackAnchor>& anchors,
+                            bool allow_edge_fallback = true) {
   const double d = cfg.nudge_distance;
   std::vector<const TrackAnchor*> relevant;
   for (const TrackAnchor& a : anchors) {
@@ -433,8 +446,10 @@ double PickNearestFreeTrack(const Config& cfg, const TrackGroup& group,
   std::vector<double> cands;
   cands.reserve(relevant.size() * 3 + 3);
   cands.push_back(std::clamp(group.coord0, free_min, free_max));
-  cands.push_back(free_min);
-  cands.push_back(free_max);
+  if (allow_edge_fallback) {
+    cands.push_back(free_min);
+    cands.push_back(free_max);
+  }
 
   std::vector<double> sorted_coords;
   sorted_coords.reserve(relevant.size());
@@ -507,6 +522,11 @@ double PickNearestFreeTrack(const Config& cfg, const TrackGroup& group,
   }
 
   for (double cand : cands) {
+    if (!allow_edge_fallback &&
+        std::abs(cand - group.coord0) >
+            cfg.max_nudge_distance + cfg.nudge_distance) {
+      continue;
+    }
     const double md = min_dist_to_anchors(cand);
     if (md >= d - 1e-4) {
       const int cross = cross_anchors.empty()
@@ -591,9 +611,14 @@ void NudgeAxis(
 
   // On cold-start full pass, routes start un-nudged so coincident tracks sit
   // within <= 1.5 px; on incremental local passes, include tracks within
-  // nudge_distance so newly placed routes detect nearby fixed tracks.
+  // max(nudge_distance, 0.5 * max_nudge_distance + 0.5) so newly placed routes
+  // detect nearby fixed tracks in elastically widened corridors without merging
+  // unrelated columns.
   const double band_gap =
-      full_graph ? 1.5 : std::max(1.5, cfg.nudge_distance - 1e-3);
+      full_graph ? 1.5
+                 : std::max(1.5, std::max(cfg.nudge_distance,
+                                          0.5 * cfg.max_nudge_distance + 0.5) -
+                                     1e-3);
   const double max_band_span =
       full_graph ? 2.5 : std::max(16.0, cfg.nudge_distance * 4.0);
   for (std::size_t b_start = 0; b_start < all_segs.size();) {
@@ -709,12 +734,24 @@ void NudgeAxis(
             static_cast<double>(all_groups.size()) * cfg.nudge_distance * 1.5,
             120.0);
 
-        bool can_use_balanced =
-            (mutable_groups.size() >= 2 && base_fixed_anchors.empty());
-        if (mutable_groups.size() >= 2 && !base_fixed_anchors.empty()) {
-          // Allow balanced equidistant layout when all fixed anchors are clear
-          // of the resulting spread.
-          can_use_balanced = true;
+        bool can_use_balanced = (mutable_groups.size() >= 2);
+        if (can_use_balanced && !full_graph) {
+          bool has_overlap = false;
+          for (std::size_t i = 0; i < mutable_groups.size() && !has_overlap;
+               ++i) {
+            for (std::size_t j = i + 1; j < mutable_groups.size(); ++j) {
+              if (IntervalsOverlap(
+                      mutable_groups[i].min_k, mutable_groups[i].max_k,
+                      mutable_groups[j].min_k, mutable_groups[j].max_k) &&
+                  std::abs(mutable_groups[i].coord0 -
+                           mutable_groups[j].coord0) <
+                      cfg.nudge_distance - 1e-3) {
+                has_overlap = true;
+                break;
+              }
+            }
+          }
+          can_use_balanced = has_overlap;
         }
 
         if (can_use_balanced) {
@@ -735,25 +772,31 @@ void NudgeAxis(
           union_mut.coord0 = coord_sum / static_cast<double>(seg_count);
           double free_min = 0.0;
           double free_max = 0.0;
+          bool bounded_both = false;
           ComputeGroupFreeBounds(cfg, index, blocks, axis, union_mut,
-                                 search_span, &free_min, &free_max);
+                                 search_span, &free_min, &free_max,
+                                 &bounded_both);
 
           if (free_max > free_min + 0.5) {
             const std::size_t m = mutable_groups.size();
-            const double ideal_span =
+            const double avail = free_max - free_min;
+            const double min_span =
                 static_cast<double>(m - 1) * cfg.nudge_distance;
             std::vector<double> targets(m);
-            if (free_max - free_min >= ideal_span) {
-              const double start =
-                  std::clamp(union_mut.coord0 - 0.5 * ideal_span, free_min,
-                             free_max - ideal_span);
+            if (avail >= min_span) {
+              const double step =
+                  bounded_both
+                      ? std::clamp((avail * 0.5) / static_cast<double>(m),
+                                   cfg.nudge_distance, cfg.max_nudge_distance)
+                      : cfg.nudge_distance;
+              const double spread = static_cast<double>(m - 1) * step;
+              const double start = std::clamp(union_mut.coord0 - 0.5 * spread,
+                                              free_min, free_max - spread);
               for (std::size_t i = 0; i < m; ++i) {
-                targets[i] =
-                    start + static_cast<double>(i) * cfg.nudge_distance;
+                targets[i] = start + static_cast<double>(i) * step;
               }
             } else {
-              const double step =
-                  (free_max - free_min) / static_cast<double>(m + 1);
+              const double step = avail / static_cast<double>(m + 1);
               for (std::size_t i = 0; i < m; ++i) {
                 targets[i] = free_min + static_cast<double>(i + 1) * step;
               }
@@ -790,27 +833,57 @@ void NudgeAxis(
           // against read-only fixed anchors and previously placed mutable ones.
           std::vector<TrackAnchor> occupied = base_fixed_anchors;
           for (const TrackGroup& g : mutable_groups) {
-            bool conflicts = false;
+            bool dist_conflict = false;
+            bool cross_conflict = false;
             for (const TrackAnchor& a : occupied) {
               if (a.net == g.net) {
                 continue;
               }
               if (IntervalsOverlap(a.min_k, a.max_k, g.min_k, g.max_k) &&
                   std::abs(g.coord0 - a.coord) < cfg.nudge_distance - 1e-3) {
-                conflicts = true;
+                dist_conflict = true;
                 break;
+              }
+            }
+            if (!dist_conflict &&
+                cfg.max_nudge_distance > cfg.nudge_distance + 1e-6) {
+              for (const TrackAnchor& a : occupied) {
+                if (a.net == g.net ||
+                    std::abs(g.coord0 - a.coord) > band_gap + 1e-3 ||
+                    !IntervalsOverlap(a.min_k, a.max_k, g.min_k, g.max_k)) {
+                  continue;
+                }
+                for (const MiddleSegment* s : g.segs) {
+                  if (CrossesOrthoPrimVert(s->prev_prim, g.coord0, s->k_at_seg,
+                                           a.coord, a.k_at_seg, a.k_at_next) ||
+                      CrossesOrthoPrimVert(g.coord0, s->next_prim, s->k_at_next,
+                                           a.coord, a.k_at_seg, a.k_at_next) ||
+                      CrossesOrthoPrimVert(a.prev_prim, a.coord, a.k_at_seg,
+                                           g.coord0, s->k_at_seg,
+                                           s->k_at_next) ||
+                      CrossesOrthoPrimVert(a.coord, a.next_prim, a.k_at_next,
+                                           g.coord0, s->k_at_seg,
+                                           s->k_at_next)) {
+                    cross_conflict = true;
+                    break;
+                  }
+                }
+                if (cross_conflict) {
+                  break;
+                }
               }
             }
 
             double chosen = g.coord0;
-            if (conflicts) {
+            if (dist_conflict || cross_conflict) {
               double free_min = 0.0;
               double free_max = 0.0;
               ComputeGroupFreeBounds(cfg, index, blocks, axis, g, search_span,
                                      &free_min, &free_max);
               if (free_max > free_min + 0.5) {
                 chosen =
-                    PickNearestFreeTrack(cfg, g, free_min, free_max, occupied);
+                    PickNearestFreeTrack(cfg, g, free_min, free_max, occupied,
+                                         /*allow_edge_fallback=*/dist_conflict);
               }
             }
             for (const MiddleSegment* s : g.segs) {

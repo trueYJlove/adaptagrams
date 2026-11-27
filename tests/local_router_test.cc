@@ -1021,6 +1021,85 @@ void TestSharedTrunkSegmentDragNoNeighborPush() {
   CHECK(async_router.view().route(99).points == neighbor_before);
 }
 
+void TestChannelNudgingElasticSpacing() {
+  Config bad_cfg;
+  bad_cfg.nudge_distance = 12.0;
+  bad_cfg.max_nudge_distance = 8.0;
+  bool threw = false;
+  try {
+    LocalOrthogonalRouter bad_router(bad_cfg);
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  CHECK(threw);
+
+  const Config cfg;
+  CHECK(cfg.nudge_distance == 10.0);
+  CHECK(cfg.max_nudge_distance == 24.0);
+
+  auto run_bundle = [&](double b2_left) {
+    LocalOrthogonalRouter r(cfg);
+    std::vector<Pin> b1_pins;
+    std::vector<Pin> b2_pins;
+    for (Id i = 0; i < 10; ++i) {
+      const double y = static_cast<double>(i + 1) / 11.0;
+      b1_pins.push_back({100 + i, 1.0, y, kRight});
+      b2_pins.push_back({200 + i, 0.0, y, kLeft});
+    }
+    r.AddBlock({1, {0.0, 0.0, 80.0, 260.0}, b1_pins});
+    r.AddBlock({2, {b2_left, 60.0, b2_left + 80.0, 320.0}, b2_pins});
+    for (Id i = 0; i < 10; ++i) {
+      r.AddConnector({100 + i, 1, 100 + i, 2, 200 + i});
+    }
+    r.RouteAllParallel(1);
+
+    std::vector<double> mid_xs;
+    mid_xs.reserve(10);
+    for (Id i = 0; i < 10; ++i) {
+      const Route& rt = r.route(100 + i);
+      CHECK(rt.status == Status::kValid);
+      CHECK(rt.points.size() == 4);
+      mid_xs.push_back(rt.points[1].x);
+    }
+    for (Id i = 0; i < 10; ++i) {
+      const auto& pa = r.route(100 + i).points;
+      for (Id j = i + 1; j < 10; ++j) {
+        const auto& pb = r.route(100 + j).points;
+        for (std::size_t sa = 1; sa < pa.size(); ++sa) {
+          for (std::size_t sb = 1; sb < pb.size(); ++sb) {
+            CHECK(
+                !SegmentsProperlyCross(pa[sa - 1], pa[sa], pb[sb - 1], pb[sb]));
+          }
+        }
+      }
+    }
+    std::sort(mid_xs.begin(), mid_xs.end());
+    std::vector<double> gaps;
+    for (std::size_t i = 1; i < mid_xs.size(); ++i) {
+      gaps.push_back(mid_xs[i] - mid_xs[i - 1]);
+    }
+    return gaps;
+  };
+
+  // Narrow corridor (80 px gap -> avail ~63.9 < 9*10): compressed cleanly.
+  const std::vector<double> narrow_gaps = run_bundle(160.0);
+  const double narrow_min =
+      *std::min_element(narrow_gaps.begin(), narrow_gaps.end());
+  const double narrow_max =
+      *std::max_element(narrow_gaps.begin(), narrow_gaps.end());
+  CHECK(narrow_min > 4.0);
+  CHECK(narrow_max < cfg.nudge_distance);
+
+  // Wide corridor (600 px gap): elastically expands > nudge_distance and
+  // <= max_nudge_distance with 0 overlaps and 0 crossings.
+  const std::vector<double> wide_gaps = run_bundle(680.0);
+  const double wide_min = *std::min_element(wide_gaps.begin(), wide_gaps.end());
+  const double wide_max = *std::max_element(wide_gaps.begin(), wide_gaps.end());
+  CHECK(wide_min > cfg.nudge_distance + 1.0);
+  CHECK(wide_max <= cfg.max_nudge_distance + 1e-6);
+  CHECK(wide_min > narrow_max);
+}
+
 }  // namespace
 }  // namespace localroute
 
@@ -1053,6 +1132,8 @@ int main(int argc, char** argv) {
        localroute::TestAsyncViewportPriorityNudge},
       {"SharedTrunkSegmentDragNoNeighborPush",
        localroute::TestSharedTrunkSegmentDragNoNeighborPush},
+      {"ChannelNudgingElasticSpacing",
+       localroute::TestChannelNudgingElasticSpacing},
   };
   try {
     for (const auto& t : kCases) {

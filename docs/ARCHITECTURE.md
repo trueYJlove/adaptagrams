@@ -101,8 +101,11 @@ qt_demo/
    * 全图冷启动（`RouteAllParallel` 合并后，`full_graph = true`）：全图 `Status::kValid` 且 `user_modified == false` 的连线属于可移动集，按确定性升序 `Id` 执行单趟全图等距分轨；凡 `user_modified == true` 的连线在全图与局部模式下均作为只读锚定轨道（Fixed Anchors），不被擅自挪动。
    * 交互拖拽与局部编辑（`RerouteAffected`、`RouteConnector`、`AutoRouteConnectors` 及 `AsyncLocalRouter::Poll` 局部收口，`full_graph = false`）：仅本次重算且未锁定（`!user_modified`）的直连线集为 `mutable_conns`；`CollectParticipants()` **不再拼合整条路由的二维大 `union_box`**，而是按确定性升序 `Id` 遍历 `mutable_conns` 中 `Status::kValid && points.size() >= 4` 连线的各可移动中间段 `[1, pts.size() - 3]`，沿线段外扩 `max(2 * nudge_distance, 80.0)` 执行窄条空间查询（局部紧凑短段簇 `<= 32` 格合并一次 `Query()`，跨区短段按 `8` 条、超长段 `> 600 px` 按 `4` 条分批 `QueryUnion()`，达到参与上限 `cap = max(256, selected.size())` 即早停；仅收集不足 `16` 条时回退补查起止端点及邻接块）。查询到的邻近非关联连线及所有 `user_modified == true` 连线**仅作为只读占用轨道（Fixed Anchors）参与冲突检测与避让**，确保拖拽时非关联线与手调线 100% 静止。
 2. **中间段与电气网表语义（`NetKey`）**：仅平移 `pts.size() >= 4` 连线的中间正交段（索引 `[1, pts.size() - 3]`），绝不篡改起止引脚位置与出线方向；按 `NetKey { src_block, src_pin }` 归组——**同一源引脚扇出允许共享主干，不同 `NetKey` 独立信号强制分轨**（同源固定线已存在时新扇出优先锚定其主干）。增量模式下若整个坐标带或冲突簇内不含可移动线段，直接整段跳过。
-3. **坐标带分桶 + 区间冲突聚类 + 固定轨道避让分配**：分别处理垂直与水平中间段；冷启动按 `<= 1.5 px` 聚合共线坐标带，交互态按 `< nudge_distance` 收集冲突簇。若簇内均为可动线且不撞固定轨道，按 Minimal-Crossing 排序在 `[free_min, free_max]` 内居中均匀摊开；当可动线与只读固定线坐标差 `< nudge_distance - 1e-3` 且区间重叠时，固定线纹丝不动，可动线通过 `PickNearestFreeTrack()` 预过滤垂直相交横向锚点（`cross_anchors`）、将候选轨道按 `(displacement, coord)` 升序去重后搜索（命中首个净空且零交叉轨道即早停），落位至空闲轨道。
-4. **安全净宽夹紧 + 局部 3 段增量复验与回滚**：通过 `SpatialGridIndex::Query` 找出同跨度左右/上下障碍物膨胀框及相邻拐点约束得到安全通道 `[free_min, free_max]`（空间极窄不足 `2 * nudge_distance` 时自动选择最大净空子隙中心）；对单一中间段非退化平移（`e_end - e_start == 1` 且相邻段无零长退化）优先调用 **`LocalOrthogonalRouter::ValidateNudgedMiddleSegment()`**，仅复验实际变更的相邻 3 段（`seg_idx - 1`、`seg_idx`、`seg_idx + 1`）的正交性、引脚出线方向与全局障碍碰撞（在首末段直接复用同一次 `index_.Query` 扫描计算 `src_buf`/`dst_buf`，其余端按需延迟查表保持完整窄缝缓冲语义），多段并移或退化时才回退 `ValidateAndSimplifyRoute()`；若任一线冲突仅单线回滚，**100% 保留原有 `Valid` 合法率**。
+3. **坐标带分桶 + 区间冲突聚类 + 宽通道弹性分轨**：分别处理垂直与水平中间段；冷启动按 `<= 1.5 px` 聚合共线坐标带，交互态按局部冲突阈值与跨度分簇。对纯活动组（含全图模式及无冲突固定线的局部组），结合障碍物膨胀框与同组线段实际起止引脚/邻点约束得到安全净宽 `avail = free_max - free_min`（`ComputeGroupFreeBounds` 通过 `bounded_both` 标记是否同时受左右/上下障碍或起止端点夹逼，防止无障碍或单侧开放通道被 `search_span` 虚高撑爆）：
+   * 通道极窄（`avail < (M - 1) * nudge_distance`）时，保持紧凑压缩步长 `avail / (M + 1)`；
+   * 通道充裕（`avail >= (M - 1) * nudge_distance`）且两侧有界时，按 `step = std::clamp((avail * 0.5) / M, nudge_distance, max_nudge_distance)` 计算弹性步长（开放或单侧无界通道保持基础 `nudge_distance`），以通道原中心 `coord0` 对称等距排布并夹紧至 `[free_min, free_max]`；
+   * 存在只读固定锚定线产生距离冲突或同通道交叉冲突时，严格遵守**固定线绝对不动**铁律，可动线通过 `PickNearestFreeTrack()` 预过滤垂直相交横向锚点（`cross_anchors`）、将候选轨道按 `(displacement, coord)` 升序去重后搜索，落位至不小于 `nudge_distance` 的最近空闲无交叉轨道。
+4. **安全净宽夹紧 + 局部 3 段增量复验与回滚**：通过 `SpatialGridIndex::Query` 找出同跨度左右/上下障碍物膨胀框及相邻拐点约束得到安全通道 `[free_min, free_max]`；对单一中间段非退化平移（`e_end - e_start == 1` 且相邻段无零长退化）优先调用 **`LocalOrthogonalRouter::ValidateNudgedMiddleSegment()`**，仅复验实际变更的相邻 3 段（`seg_idx - 1`、`seg_idx`、`seg_idx + 1`）的正交性、引脚出线方向与全局障碍碰撞（在首末段直接复用同一次 `index_.Query` 扫描计算 `src_buf`/`dst_buf`，其余端按需延迟查表保持完整窄缝缓冲语义），多段并移或退化时才回退 `ValidateAndSimplifyRoute()`；若任一线冲突仅单线回滚，**100% 保留原有 `Valid` 合法率**。
 
 ### 3.5 异步会话模型（`AsyncLocalRouter`）
 
@@ -141,7 +144,8 @@ qt_demo/
 | `padding` | `250.0` | 初始局部路由窗口外扩边距，重试时按 $2^k$ 扩张 |
 | `buffer` | `8.0` | 连线与模块边界的最小避障缓冲净空（近距排版场景可适当调小至 `4.0 ~ 6.0`） |
 | `penalty` | `50.0` | 单次 90° 拐弯惩罚（越高越倾向少拐点） |
-| `nudge_distance` | `6.0` | `ChannelNudger` 通道内相邻平行线目标间距（像素） |
+| `nudge_distance` | `10.0` | `ChannelNudger` 通道内相邻平行线基础最小间距（像素） |
+| `max_nudge_distance` | `24.0` | `ChannelNudger` 宽通道自适应弹性分轨步长上限（像素，配置校验要求 `max_nudge_distance >= nudge_distance`） |
 | `retries` | `3` | 局部窗口增量补障最大重试次数 |
 | `budget` | `120` | 单次局部求解传入求解器的最大障碍物数量预算 |
 | `settle_nudge` | `false` | 松手时是否传递 `nudge = true` 给求解器 |
@@ -277,14 +281,15 @@ localroute::LocalOrthogonalRouter router(cfg, std::make_shared<CustomSolver>());
 
 ## 7. 万级规模实测性能基线（Release `-O3`，开启 `enable_channel_nudging = true`）
 
-以下为默认 `LazyHananAStarSolver` + `ChannelNudger` 在 10,000 模块 / 20,000 连线（seed 42，含 15% 超长跨度连线，Windows Clang + Ninja Release）下的实测数据（完整历史 `libavoid` 同台对照记录归档于 Git 标签 `v1-libavoid-baseline`）：
+以下为默认 `LazyHananAStarSolver` + `ChannelNudger`（`nudge_distance = 10.0`、`max_nudge_distance = 24.0`）在 10,000 模块 / 20,000 连线（seed 42，含 15% 超长跨度连线，Windows Clang + Ninja Release）下的实测数据（完整历史 `libavoid` 同台对照记录归档于 Git 标签 `v1-libavoid-baseline`）：
 
 | 场景（10,000 模块 / 20,000 连线） | 指标 | 实测表现 |
 | :--- | :--- | :--- |
-| 同步 4 线程全图冷启动（`D_cold`） | 总耗时 / 合法率 | **2.35 s**（`2346.29 ms`） / **99.53%**（19,906 Valid, 94 DisplayOnly, 0 Failed） |
-| 同步单长线局部拖拽（`D_drag`，10 帧） | P50 / P99 | **0.361 ms** / **0.937 ms** |
-| 同步单模块拖拽（`A`，200 帧） | P50 / P99 | **0.410 ms** / **4.556 ms**（mean `0.614 ms`，非关联线误提交 0） |
-| 同步 20 模块框选拖拽（`B20`，200 帧） | P50 / P99 | **1.445 ms** / **4.986 ms**（mean `1.608 ms`） |
-| 同步穿插密集连线区（`C`，200 帧） | P50 / P99 | **0.604 ms** / **1.690 ms**（P95 `1.175 ms`，非关联线误提交 0） |
-| `qt_demo` Async 10k 交互冒烟（含箭头/焊点/跳线弧） | `Paint Time` / 增量 `Undo` / `Redo` | **5.66 ~ 8.85 ms** / **0.978 ms** / **0.117 ms** |
-| `qt_demo` Sync 10k 局部渲染（含箭头/焊点/跳线弧） | `Paint Time` | **6.84 ~ 8.72 ms** |
+| 同步 4 线程全图冷启动（`D_cold`） | 总耗时 / 合法率 | **2.93 s**（`2932.5 ms`） / **99.53%**（19,906 Valid, 94 DisplayOnly, 0 Failed） |
+| 同步单长线局部拖拽（`D_drag`，10 帧） | P50 / P99 | **0.410 ms** / **0.927 ms** |
+| 同步单模块拖拽（`A`，200 帧） | P50 / P99 | **0.497 ms** / **4.377 ms**（mean `0.817 ms`，非关联线误提交 0） |
+| 同步 20 模块框选拖拽（`B20`，200 帧） | P50 / P99 | **2.875 ms** / **9.108 ms**（mean `3.308 ms`） |
+| 同步 50 模块框选拖拽（`B50`，200 帧） | P50 / P99 | **8.143 ms** / **20.523 ms**（mean `8.736 ms`） |
+| 同步穿插密集连线区（`C`，200 帧） | P50 / P99 | **0.980 ms** / **3.663 ms**（mean `1.187 ms`，非关联线误提交 0） |
+| `qt_demo` Async 10k 交互冒烟（含箭头/焊点/跳线弧） | `Paint Time` / 增量 `Undo` / `Redo` | **7.90 ~ 10.03 ms** / **1.654 ms** / **1.018 ms** |
+| `qt_demo` Sync 10k 局部渲染（含箭头/焊点/跳线弧） | `Paint Time` | **8.20 ~ 9.89 ms** |

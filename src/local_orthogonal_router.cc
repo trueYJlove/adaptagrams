@@ -341,7 +341,10 @@ LocalOrthogonalRouter::LocalOrthogonalRouter(
   if (!(cfg.cell >= 1.0 && cfg.padding > 0.0 && cfg.padding <= 1e5 &&
         cfg.buffer >= 0.0 && cfg.buffer <= 1e4 && cfg.penalty > 0.0 &&
         std::isfinite(cfg.penalty) && cfg.nudge_distance > 0.0 &&
-        std::isfinite(cfg.nudge_distance) && cfg.wire_overlap_penalty >= 0.0 &&
+        std::isfinite(cfg.nudge_distance) &&
+        std::isfinite(cfg.max_nudge_distance) &&
+        cfg.max_nudge_distance >= cfg.nudge_distance &&
+        cfg.wire_overlap_penalty >= 0.0 &&
         std::isfinite(cfg.wire_overlap_penalty) && cfg.budget >= 2 &&
         cfg.retries <= 8)) {
     throw std::invalid_argument("invalid local router config");

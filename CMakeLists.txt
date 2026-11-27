@@ -47,6 +47,7 @@ if(LOCALROUTE_BUILD_TESTS)
         AsyncIncrementalTopoFifoOrder
         AsyncViewportPriorityNudge
         SharedTrunkSegmentDragNoNeighborPush
+        ChannelNudgingElasticSpacing
     )
         add_test(NAME local.${t} COMMAND test_unit ${t})
     endforeach()
