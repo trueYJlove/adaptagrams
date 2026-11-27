@@ -131,6 +131,7 @@ int CountGroupCrossings(const TrackGroup& group, double cand_coord,
 
 std::vector<Id> CollectParticipants(
     const Config& cfg, const SpatialGridIndex& index,
+    const SpatialGrid<std::uint64_t>* segments,
     const std::unordered_map<Id, Conn>& conns,
     const std::unordered_map<Id, std::vector<Id>>& adjacent,
     const std::unordered_map<Id, Route>& routes,
@@ -191,6 +192,19 @@ std::vector<Id> CollectParticipants(
       }
     }
   };
+  auto collect_from_segments = [&](const std::vector<std::uint64_t>& keys) {
+    for (std::uint64_t key : keys) {
+      if (selected.size() >= cap) {
+        return;
+      }
+      const Id seg_cid = static_cast<Id>(key >> 32);
+      const auto rit = routes.find(seg_cid);
+      if (rit != routes.end() && rit->second.status == Status::kValid &&
+          rit->second.points.size() >= 4) {
+        selected.insert(seg_cid);
+      }
+    }
+  };
 
   // Query narrow strips along movable middle segments j in [1, pts.size()-3].
   // Compact local segments (bounding <= 32 grid cells) coalesce into a single
@@ -234,6 +248,9 @@ std::vector<Id> CollectParticipants(
         static_cast<std::int64_t>(std::floor(short_bounds.t / cfg.cell));
     if (cells_w * cells_h <= 32) {
       collect_from_blocks(index.Query(short_bounds));
+      if (segments && selected.size() < cap) {
+        collect_from_segments(segments->Query(short_bounds));
+      }
     } else {
       constexpr std::size_t kShortBatchSize = 8;
       std::vector<Rect> batch;
@@ -247,6 +264,9 @@ std::vector<Id> CollectParticipants(
           batch.push_back(short_strips[k]);
         }
         collect_from_blocks(index.QueryUnion(batch));
+        if (segments && selected.size() < cap) {
+          collect_from_segments(segments->QueryUnion(batch));
+        }
       }
     }
   }
@@ -265,6 +285,9 @@ std::vector<Id> CollectParticipants(
         batch.push_back(long_strips[k]);
       }
       collect_from_blocks(index.QueryUnion(batch));
+      if (segments && selected.size() < cap) {
+        collect_from_segments(segments->QueryUnion(batch));
+      }
     }
   }
   if (selected.size() < 16) {
@@ -972,8 +995,10 @@ std::vector<Id> ChannelNudger::Nudge(LocalOrthogonalRouter* router,
   }
   std::unordered_set<Id> mutable_set;
   const std::vector<Id> participants = CollectParticipants(
-      router->cfg_, router->index_, router->conns_, router->adjacent_,
-      router->routes_, mutable_conns, full_graph, &mutable_set);
+      router->cfg_, router->index_,
+      router->cfg_.reroute_third_party_blocked ? &router->segments_ : nullptr,
+      router->conns_, router->adjacent_, router->routes_, mutable_conns,
+      full_graph, &mutable_set);
   if (participants.size() < 2 || mutable_set.empty()) {
     return {};
   }
@@ -989,14 +1014,7 @@ std::vector<Id> ChannelNudger::Nudge(LocalOrthogonalRouter* router,
     if (!router->cfg_.reroute_third_party_blocked) {
       return;
     }
-    router->ClearSegments(cid);
-    const Route& r = router->routes_.at(cid);
-    if (r.status == Status::kValid) {
-      for (std::size_t j = 1; j < r.points.size(); ++j) {
-        router->segments_.Insert((static_cast<std::uint64_t>(cid) << 32) | j,
-                                 Box(r.points[j - 1], r.points[j]), true);
-      }
-    }
+    router->IndexSegments(cid, router->routes_.at(cid));
   };
 
   std::set<Id> changed;

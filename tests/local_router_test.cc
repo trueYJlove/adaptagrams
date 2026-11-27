@@ -1,5 +1,7 @@
 #include <chrono>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <iostream>
 #include <memory>
@@ -10,6 +12,7 @@
 #include <vector>
 
 #include "localroute/async_local_router.h"
+#include "topology_generator.h"
 
 namespace localroute {
 namespace {
@@ -1109,6 +1112,567 @@ void TestChannelNudgingElasticSpacing() {
   CHECK(wide_min > mid_max);
 }
 
+class FixedMultiSegSolver final : public LocalRouteSolver {
+ public:
+  const char* name() const override { return "FixedMultiSegSolver"; }
+  std::vector<Point> Solve(const Request& r) const override {
+    if (r.conn.id == 1) {
+      return {{40.0, 20.0},  {108.0, 20.0},  {108.0, 60.0},
+              {120.0, 60.0}, {120.0, 120.0}, {200.0, 120.0}};
+    }
+    return inner_->Solve(r);
+  }
+
+ private:
+  std::shared_ptr<const LocalRouteSolver> inner_ = LazyHananAStarSolver();
+};
+
+void TestSegmentIndexStateMachineAndShrink() {
+  // 1. DisplayOnly + kReuse followed by AutoRouteConnectors & RemoveConnector.
+  {
+    Config cfg;
+    cfg.buffer = 6.0;
+    cfg.reroute_third_party_blocked = true;
+    LocalOrthogonalRouter r(cfg);
+    r.AddBlock({1, {0.0, 20.0, 60.0, 60.0}, {{1, 1.0, 0.5, kRight}}});
+    r.AddBlock({2, {300.0, 20.0, 360.0, 60.0}, {{2, 0.0, 0.5, kLeft}}});
+    r.AddBlock({3, {160.0, 10.0, 200.0, 70.0}, {}});
+    r.AddConnector({1, 1, 1, 2, 2});
+    r.RouteAllParallel(1);
+    CHECK(r.route(1).status == Status::kValid);
+    CHECK(r.route(1).points.size() >= 6);
+
+    CHECK(r.MoveRouteSegment(1, 2, 40.0));
+    CHECK(r.route(1).status == Status::kDisplayOnly);
+    CHECK(r.route(1).method == RouteMethod::kReuse);
+
+    const std::vector<Id> auto_changed = r.AutoRouteConnectors({1});
+    CHECK(!auto_changed.empty());
+    CHECK(r.route(1).status == Status::kValid);
+
+    CHECK(r.MoveRouteSegment(1, 2, 40.0));
+    CHECK(r.route(1).status == Status::kDisplayOnly);
+    r.RemoveConnector(1);
+    CHECK(r.all_conns().empty());
+  }
+
+  // 2. MarkConnector -> enable reroute_third_party_blocked -> Route/Reroute.
+  {
+    Config cfg;
+    cfg.buffer = 6.0;
+    LocalOrthogonalRouter r(cfg);
+    r.AddBlock({1, {0.0, 0.0, 60.0, 40.0}, {{1, 1.0, 0.5, kRight}}});
+    r.AddBlock({2, {200.0, 40.0, 260.0, 80.0}, {{2, 0.0, 0.5, kLeft}}});
+    r.AddConnector({1, 1, 1, 2, 2});
+    r.RouteAllParallel(1);
+    CHECK(r.route(1).status == Status::kValid);
+
+    r.MarkConnector(1);
+    CHECK(r.route(1).status == Status::kPending);
+    r.set_reroute_third_party_blocked(true);
+    r.RouteConnector(1);
+    CHECK(r.route(1).status == Status::kValid);
+
+    r.MarkConnector(1);
+    (void)r.RerouteAffected({});
+    CHECK(r.route(1).status == Status::kValid);
+  }
+
+  // 3. Segment count shrink via ChannelNudger removes stale segment keys.
+  {
+    Config cfg;
+    cfg.buffer = 4.0;
+    cfg.nudge_distance = 12.0;
+    cfg.fast_paths = false;
+    cfg.reroute_third_party_blocked = true;
+    cfg.enable_channel_nudging = false;
+    LocalOrthogonalRouter r(cfg, std::make_shared<FixedMultiSegSolver>());
+    r.AddBlock({1, {0.0, 0.0, 40.0, 40.0}, {{1, 1.0, 0.5, kRight}}});
+    r.AddBlock({2, {200.0, 100.0, 240.0, 140.0}, {{2, 0.0, 0.5, kLeft}}});
+    r.AddBlock({3, {0.0, -60.0, 40.0, -20.0}, {{1, 1.0, 0.5, kRight}}});
+    r.AddBlock({4, {200.0, 160.0, 240.0, 200.0}, {{2, 0.0, 0.5, kLeft}}});
+    r.AddConnector({1, 1, 1, 2, 2});
+    r.AddConnector({2, 3, 1, 4, 2});
+
+    r.RouteConnector(1);
+    CHECK(r.route(1).status == Status::kValid);
+    CHECK(r.route(1).points.size() == 6);
+
+    Route anchor;
+    anchor.status = Status::kValid;
+    anchor.method = RouteMethod::kReuse;
+    anchor.user_modified = true;
+    anchor.points = {
+        {40.0, -40.0}, {120.0, -40.0}, {120.0, 180.0}, {200.0, 180.0}};
+    r.RestoreRoute(2, std::move(anchor));
+
+    r.set_enable_channel_nudging(true);
+    r.RouteConnector(1);
+    CHECK(r.route(1).status == Status::kValid);
+    CHECK(r.route(1).points.size() == 4);
+    CHECK(std::abs(r.route(1).points[1].x - 109.0) <= 1e-6);
+
+    // Adding an obstacle overlapping only the old (x=120, y:[60,120]) segment
+    // must not invalidate conn 1 whose simplified segment moved to x=109.
+    r.AddBlock({99, {122.0, 80.0, 140.0, 100.0}, {}});
+    CHECK(r.route(1).status == Status::kValid);
+
+    r.RemoveConnector(1);
+    CHECK(!r.all_conns().count(1));
+  }
+}
+
+void TestAsyncThirdPartySegmentsSync() {
+  auto drain = [](AsyncLocalRouter* ar) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (ar->PendingCount() > 0) {
+      CHECK(std::chrono::steady_clock::now() < deadline);
+      if (!ar->Poll(64)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    }
+    ar->Poll(64);
+  };
+
+  // 1. Construct AsyncLocalRouter from pre-routed model with
+  //    reroute_third_party_blocked = true.
+  {
+    Config cfg;
+    cfg.buffer = 6.0;
+    cfg.reroute_third_party_blocked = true;
+    LocalOrthogonalRouter initial(cfg);
+    initial.AddBlock({1, {0.0, 0.0, 60.0, 40.0}, {{1, 1.0, 0.5, kRight}}});
+    initial.AddBlock({2, {240.0, 0.0, 300.0, 40.0}, {{2, 0.0, 0.5, kLeft}}});
+    initial.AddBlock({3, {120.0, 120.0, 180.0, 160.0}, {}});
+    initial.AddConnector({1, 1, 1, 2, 2});
+    initial.RouteAllParallel(1);
+    CHECK(initial.route(1).status == Status::kValid);
+
+    AsyncLocalRouter ar(std::move(initial));
+    ar.Move({{3, {120.0, 0.0, 180.0, 40.0}}});
+    drain(&ar);
+    CHECK(ar.view().route(1).status == Status::kValid);
+    CHECK(ar.view().route(1).points.size() >= 4);
+  }
+
+  // 2. Enable reroute_third_party_blocked at runtime after StartAll().
+  {
+    Config cfg;
+    cfg.buffer = 6.0;
+    cfg.reroute_third_party_blocked = false;
+    LocalOrthogonalRouter initial(cfg);
+    initial.AddBlock({1, {0.0, 0.0, 60.0, 40.0}, {{1, 1.0, 0.5, kRight}}});
+    initial.AddBlock({2, {240.0, 0.0, 300.0, 40.0}, {{2, 0.0, 0.5, kLeft}}});
+    initial.AddBlock({3, {120.0, 120.0, 180.0, 160.0}, {}});
+    initial.AddConnector({1, 1, 1, 2, 2});
+
+    AsyncLocalRouter ar(std::move(initial));
+    ar.StartAll();
+    drain(&ar);
+    CHECK(ar.view().route(1).status == Status::kValid);
+
+    ar.set_reroute_third_party_blocked(true);
+    ar.Move({{3, {120.0, 0.0, 180.0, 40.0}}});
+    drain(&ar);
+    CHECK(ar.view().route(1).status == Status::kValid);
+    CHECK(ar.view().route(1).points.size() >= 4);
+  }
+}
+
+void TestAsyncRestorePendingRouteConverges() {
+  Config cfg;
+  cfg.buffer = 6.0;
+  LocalOrthogonalRouter initial(cfg);
+  initial.AddBlock({1, {0.0, 0.0, 80.0, 60.0}, {{1, 1.0, 0.5, kRight}}});
+  initial.AddBlock({2, {240.0, 40.0, 320.0, 100.0}, {{2, 0.0, 0.5, kLeft}}});
+
+  AsyncLocalRouter ar(std::move(initial));
+  ar.AddConnector({1, 1, 1, 2, 2});
+  CHECK(ar.PendingCount() == 1);
+  const Route pending_snap = ar.view().route(1);
+  CHECK(pending_snap.status == Status::kPending);
+
+  const std::vector<Id> changed = ar.AutoRouteConnectors({1});
+  CHECK(changed.size() == 1);
+  CHECK(ar.view().route(1).status == Status::kValid);
+  CHECK(ar.PendingCount() == 0);
+
+  ar.RestoreRoute(1, pending_snap);
+  CHECK(ar.view().route(1).status == Status::kPending);
+  CHECK(ar.PendingCount() > 0);
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (ar.PendingCount() > 0) {
+    CHECK(std::chrono::steady_clock::now() < deadline);
+    if (!ar.Poll(64)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+  ar.Poll(64);
+  CHECK(ar.view().route(1).status == Status::kValid);
+  CHECK(ar.view().route(1).points.size() >= 4);
+}
+
+void TestAsyncLargeBatchZeroDisturbance() {
+  const Topology top = GenerateTopology(1000);
+  Config cfg;
+  cfg.enable_channel_nudging = true;
+  LocalOrthogonalRouter initial(cfg);
+  for (const auto& b : top.blocks) {
+    initial.AddBlock(b);
+  }
+  for (const auto& c : top.conns) {
+    initial.AddConnector(c);
+  }
+
+  // Remote hub block with 257 connectors (> 256) placed far away from the
+  // 1000-block topology.
+  const Id hub_id = 20000;
+  std::vector<Pin> hub_pins;
+  hub_pins.reserve(257);
+  for (Id p = 1; p <= 257; ++p) {
+    hub_pins.push_back({p, 1.0, static_cast<double>(p) / 258.0, kRight});
+  }
+  initial.AddBlock({hub_id, {30000.0, 0.0, 30100.0, 2600.0}, hub_pins});
+  for (Id i = 0; i < 257; ++i) {
+    const Id leaf_id = 20001 + i;
+    const double y = static_cast<double>(i) * 20.0;
+    initial.AddBlock(
+        {leaf_id, {30300.0, y, 30380.0, y + 12.0}, {{1, 0.0, 0.5, kLeft}}});
+    initial.AddConnector({50000 + i, hub_id, i + 1, leaf_id, 1});
+  }
+
+  AsyncLocalRouter ar(std::move(initial));
+  ar.StartAll();
+  auto drain = [&]() {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (ar.PendingCount() > 0) {
+      CHECK(std::chrono::steady_clock::now() < deadline);
+      if (!ar.Poll(256)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    }
+    ar.Poll(256);
+  };
+  drain();
+
+  std::vector<std::vector<Point>> saved_points;
+  saved_points.reserve(top.conns.size());
+  for (const auto& c : top.conns) {
+    saved_points.push_back(ar.view().route(c.id).points);
+  }
+
+  // Move the 257-connector hub; must stay in incremental full_graph = false
+  // mode and leave all 2,000 original topology routes completely untouched.
+  ar.Move({{hub_id, {30000.0, 20.0, 30100.0, 2620.0}}});
+  drain();
+
+  for (std::size_t i = 0; i < top.conns.size(); ++i) {
+    CHECK(ar.view().route(top.conns[i].id).points == saved_points[i]);
+  }
+}
+
+void TestAsyncNudgeSyncBackAndPriorityRace() {
+  auto drain = [](AsyncLocalRouter* ar) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (ar->PendingCount() > 0) {
+      CHECK(std::chrono::steady_clock::now() < deadline);
+      if (!ar->Poll(64)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    }
+    ar->Poll(64);
+  };
+
+  // Part A: after async nudging & deleting wire 2, translating wire 1 keeps
+  // its nudged track instead of snapping back to the raw midline (x = 200).
+  {
+    Config cfg;
+    cfg.buffer = 6.0;
+    cfg.nudge_distance = 12.0;
+    cfg.enable_channel_nudging = true;
+    LocalOrthogonalRouter initial(cfg);
+    initial.AddBlock({1, {0.0, 0.0, 80.0, 50.0}, {{1, 1.0, 0.5, kRight}}});
+    initial.AddBlock({2, {320.0, 100.0, 400.0, 150.0}, {{2, 0.0, 0.5, kLeft}}});
+    initial.AddBlock({3, {0.0, 70.0, 80.0, 120.0}, {{1, 1.0, 0.5, kRight}}});
+    initial.AddBlock({4, {320.0, 170.0, 400.0, 220.0}, {{2, 0.0, 0.5, kLeft}}});
+    initial.AddConnector({1, 1, 1, 2, 2});
+    initial.AddConnector({2, 3, 1, 4, 2});
+
+    AsyncLocalRouter ar(std::move(initial));
+    ar.StartAll();
+    drain(&ar);
+
+    CHECK(ar.view().route(1).status == Status::kValid);
+    CHECK(ar.view().route(2).status == Status::kValid);
+    CHECK(ar.view().route(1).points.size() == 4);
+    const double nudged_x1 = ar.view().route(1).points[1].x;
+    CHECK(std::abs(nudged_x1 - 200.0) > 1.0);
+
+    ar.RemoveConnector(2);
+    ar.Move({{1, {0.0, 10.0, 80.0, 60.0}}, {2, {320.0, 110.0, 400.0, 160.0}}});
+    drain(&ar);
+
+    CHECK(ar.view().route(1).status == Status::kValid);
+    CHECK(ar.view().route(1).points.size() == 4);
+    CHECK(std::abs(ar.view().route(1).points[1].x - nudged_x1) <= 1e-6);
+  }
+
+  // Part B: priority_wave_finished sync-back followed immediately by Move,
+  // RemoveConnector, AddConnector (same ID & new ID) must never clobber new
+  // edits with stale nudged routes.
+  {
+    Config cfg;
+    cfg.buffer = 6.0;
+    cfg.nudge_distance = 12.0;
+    cfg.enable_channel_nudging = true;
+    LocalOrthogonalRouter initial(cfg);
+    initial.AddBlock({1, {0.0, 0.0, 80.0, 50.0}, {{1, 1.0, 0.5, kRight}}});
+    initial.AddBlock({2, {320.0, 100.0, 400.0, 150.0}, {{2, 0.0, 0.5, kLeft}}});
+    initial.AddBlock({3, {0.0, 70.0, 80.0, 120.0}, {{1, 1.0, 0.5, kRight}}});
+    initial.AddBlock({4, {320.0, 170.0, 400.0, 220.0}, {{2, 0.0, 0.5, kLeft}}});
+    initial.AddConnector({1, 1, 1, 2, 2});
+    initial.AddConnector({2, 3, 1, 4, 2});
+
+    Id next_bid = 100;
+    Id next_cid = 100;
+    for (int i = 0; i < 300; ++i) {
+      const double y = static_cast<double>(i) * 120.0;
+      const Id s = next_bid++;
+      const Id d = next_bid++;
+      initial.AddBlock(
+          {s, {5000.0, y, 5080.0, y + 50.0}, {{1, 1.0, 0.5, kRight}}});
+      initial.AddBlock(
+          {d, {5300.0, y + 40.0, 5380.0, y + 90.0}, {{2, 0.0, 0.5, kLeft}}});
+      initial.AddConnector({next_cid++, s, 1, d, 2});
+    }
+
+    AsyncLocalRouter ar(std::move(initial));
+    ar.Prioritize({-50.0, -50.0, 450.0, 350.0});
+    ar.StartAll();
+
+    bool triggered_pri_nudge = false;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (ar.PendingCount() > 0) {
+      CHECK(std::chrono::steady_clock::now() < deadline);
+      if (!ar.Poll(2)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        continue;
+      }
+      const auto& v = ar.view();
+      if (v.route(1).status == Status::kValid &&
+          v.route(2).status == Status::kValid && ar.PendingCount() > 0) {
+        const double gap =
+            std::abs(v.route(1).points[1].x - v.route(2).points[1].x);
+        CHECK(gap >= 4.0);
+        triggered_pri_nudge = true;
+        break;
+      }
+    }
+    CHECK(triggered_pri_nudge);
+
+    ar.Move({{1, {0.0, 15.0, 80.0, 65.0}}});
+    ar.RemoveConnector(2);
+    ar.AddBlock({5, {320.0, 260.0, 400.0, 310.0}, {{2, 0.0, 0.5, kLeft}}});
+    ar.AddConnector({2, 3, 1, 5, 2});
+    ar.AddConnector({9999, 1, 1, 5, 2});
+    drain(&ar);
+
+    const auto& v = ar.view();
+    CHECK(v.route(1).status == Status::kValid);
+    CHECK(std::abs(v.route(1).points.front().y - 40.0) <= 1e-6);
+    CHECK(v.route(2).status == Status::kValid);
+    CHECK(std::abs(v.route(2).points.back().y - 285.0) <= 1e-6);
+    CHECK(v.route(9999).status == Status::kValid);
+    CHECK(std::abs(v.route(9999).points.front().y - 40.0) <= 1e-6);
+    CHECK(std::abs(v.route(9999).points.back().y - 285.0) <= 1e-6);
+  }
+}
+
+void TestSameBlockSelfLoopWithBuffer() {
+  Config cfg;
+  cfg.buffer = 8.0;
+  LocalOrthogonalRouter r(cfg);
+  const Rect blk{0.0, 0.0, 100.0, 60.0};
+  r.AddBlock({1,
+              blk,
+              {{1, 1.0, 0.5, kRight},
+               {2, 0.0, 0.5, kLeft},
+               {3, 1.0, 0.25, kRight},
+               {4, 1.0, 0.75, kRight}}});
+  r.AddConnector({1, 1, 1, 1, 2});
+  r.AddConnector({2, 1, 3, 1, 4});
+  r.RouteAllParallel(1);
+
+  for (Id cid : {Id{1}, Id{2}}) {
+    const Route& rt = r.route(cid);
+    CHECK(rt.status == Status::kValid);
+    CHECK(rt.points.size() >= 4);
+    for (std::size_t i = 1; i < rt.points.size(); ++i) {
+      const Point& u = rt.points[i - 1];
+      const Point& v = rt.points[i];
+      CHECK(u.x == v.x || u.y == v.y);
+      CHECK(!(u == v));
+      const Rect s = Box(u, v);
+      CHECK(!(s.r > blk.l && s.l < blk.r && s.b > blk.t && s.t < blk.b));
+    }
+  }
+  CHECK(r.route(1).points[1].x > blk.r);
+  CHECK(r.route(1).points[r.route(1).points.size() - 2].x < blk.l);
+}
+
+void TestExportRegionToSvgUtf8Path() {
+  LocalOrthogonalRouter r;
+  r.AddBlock({1, {0.0, 0.0, 80.0, 60.0}, {{1, 1.0, 0.5, kRight}}});
+  r.AddBlock({2, {200.0, 0.0, 280.0, 60.0}, {{2, 0.0, 0.5, kLeft}}});
+  r.AddConnector({1, 1, 1, 2, 2});
+  r.RouteAllParallel(1);
+
+  const std::filesystem::path target =
+      std::filesystem::temp_directory_path() /
+      std::filesystem::u8path(
+          "localroute_\xE6\xB5\x8B\xE8\xAF\x95_\xF0\x9F\x94\x8C.svg");
+  std::filesystem::remove(target);
+  r.ExportRegionToSvg(target.u8string(), {-20.0, -20.0, 300.0, 100.0});
+  CHECK(std::filesystem::exists(target));
+  {
+    std::ifstream ifs(target);
+    CHECK(ifs.is_open());
+    const std::string content((std::istreambuf_iterator<char>(ifs)),
+                              std::istreambuf_iterator<char>());
+    CHECK(content.find("<svg") != std::string::npos);
+    CHECK(content.find("</svg>") != std::string::npos);
+  }
+  std::filesystem::remove(target);
+}
+
+void TestLocalNudgeThirdPartySegmentsLookup() {
+  Config cfg;
+  cfg.buffer = 6.0;
+  cfg.nudge_distance = 12.0;
+  cfg.reroute_third_party_blocked = true;
+  cfg.enable_channel_nudging = true;
+  LocalOrthogonalRouter r(cfg);
+
+  // Passing long-span wire whose endpoints sit at x = -2000 and x = 2000, so
+  // its vertical middle segment at x = 30 passes through a local corridor far
+  // from both endpoint blocks.
+  r.AddBlock({1, {-2060.0, 0.0, -1940.0, 40.0}, {{1, 1.0, 0.5, kRight}}});
+  r.AddBlock({2, {2000.0, 200.0, 2060.0, 240.0}, {{2, 0.0, 0.5, kLeft}}});
+  r.AddConnector({1, 1, 1, 2, 2});
+  r.RouteAllParallel(1);
+  CHECK(r.route(1).status == Status::kValid);
+  CHECK(r.route(1).points.size() == 4);
+  const std::vector<Point> long_before = r.route(1).points;
+  const double long_mid_x = long_before[1].x;
+  CHECK(std::abs(long_mid_x - 30.0) <= 1e-6);
+
+  // Local wire whose default midline also lands on x = 30.0.
+  r.AddBlock({3, {-60.0, 60.0, 0.0, 100.0}, {{1, 1.0, 0.5, kRight}}});
+  r.AddBlock({4, {60.0, 120.0, 120.0, 160.0}, {{2, 0.0, 0.5, kLeft}}});
+  r.AddConnector({2, 3, 1, 4, 2});
+  r.RouteConnector(2);
+
+  CHECK(r.route(1).points == long_before);
+  CHECK(r.route(2).status == Status::kValid);
+  CHECK(r.route(2).points.size() == 4);
+  CHECK(std::abs(r.route(2).points[1].x - long_mid_x) >=
+        cfg.nudge_distance - 1e-3);
+}
+
+void TestRestoreRouteEndpointValidation() {
+  // 1. Sync router downgrades misaligned or short kValid routes to kPending.
+  {
+    LocalOrthogonalRouter r;
+    AddPair(&r);
+    r.RouteAllParallel(1);
+    CHECK(r.route(1).status == Status::kValid);
+    const Route saved = r.route(1);
+
+    r.MoveBlock(1, 0.0, 20.0);
+    r.RestoreRoute(1, saved);
+    CHECK(r.route(1).status == Status::kPending);
+
+    const std::vector<Id> rerouted = r.RerouteAffected({});
+    CHECK(rerouted == std::vector<Id>{1});
+    CHECK(r.route(1).status == Status::kValid);
+    CHECK(std::abs(r.route(1).points.front().y - 40.0) <= 1e-6);
+
+    Route short_valid = saved;
+    short_valid.points = {{40.0, 40.0}};
+    r.RestoreRoute(1, std::move(short_valid));
+    CHECK(r.route(1).status == Status::kPending);
+  }
+
+  // 2. Async router re-queues downgraded kValid snapshots and converges.
+  {
+    LocalOrthogonalRouter initial;
+    AddPair(&initial);
+    initial.RouteAllParallel(1);
+    const Route saved = initial.route(1);
+
+    AsyncLocalRouter ar(std::move(initial));
+    ar.Move({{1, {0.0, 20.0, 40.0, 60.0}}});
+    auto drain = [&]() {
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      while (ar.PendingCount() > 0) {
+        CHECK(std::chrono::steady_clock::now() < deadline);
+        if (!ar.Poll(32)) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+      }
+      ar.Poll(32);
+    };
+    drain();
+    CHECK(ar.view().route(1).status == Status::kValid);
+
+    ar.RestoreRoute(1, saved);
+    CHECK(ar.view().route(1).status == Status::kPending);
+    CHECK(ar.PendingCount() > 0);
+    drain();
+    CHECK(ar.view().route(1).status == Status::kValid);
+    CHECK(std::abs(ar.view().route(1).points.front().y - 40.0) <= 1e-6);
+  }
+}
+
+void TestSpatialGridCrossRegionDuplicateCheck() {
+  SpatialGridIndex g(100.0);
+  const Rect small_rect{0.0, 0.0, 50.0, 50.0};
+  const Rect large_rect{0.0, 0.0, 4000.0, 4000.0};
+
+  auto expect_dup = [&](auto fn) {
+    bool threw = false;
+    try {
+      fn();
+    } catch (const std::invalid_argument&) {
+      threw = true;
+    }
+    CHECK(threw);
+  };
+
+  // boxes_ -> boxes_ and boxes_ -> overflow_
+  g.Insert(1, small_rect, false);
+  expect_dup([&] { g.Insert(1, small_rect, false); });
+  expect_dup([&] { g.Insert(1, large_rect, true); });
+
+  // overflow_ -> overflow_ and overflow_ -> boxes_
+  g.Insert(2, large_rect, true);
+  expect_dup([&] { g.Insert(2, large_rect, true); });
+  expect_dup([&] { g.Insert(2, small_rect, false); });
+
+  g.Remove(1);
+  g.Remove(2);
+  g.Insert(1, large_rect, true);
+  g.Insert(2, small_rect, false);
+  CHECK(g.Query({10.0, 10.0, 20.0, 20.0}) == std::vector<Id>({1, 2}));
+}
+
 }  // namespace
 }  // namespace localroute
 
@@ -1143,6 +1707,25 @@ int main(int argc, char** argv) {
        localroute::TestSharedTrunkSegmentDragNoNeighborPush},
       {"ChannelNudgingElasticSpacing",
        localroute::TestChannelNudgingElasticSpacing},
+      {"SegmentIndexStateMachineAndShrink",
+       localroute::TestSegmentIndexStateMachineAndShrink},
+      {"AsyncThirdPartySegmentsSync",
+       localroute::TestAsyncThirdPartySegmentsSync},
+      {"AsyncRestorePendingRouteConverges",
+       localroute::TestAsyncRestorePendingRouteConverges},
+      {"AsyncLargeBatchZeroDisturbance",
+       localroute::TestAsyncLargeBatchZeroDisturbance},
+      {"AsyncNudgeSyncBackAndPriorityRace",
+       localroute::TestAsyncNudgeSyncBackAndPriorityRace},
+      {"SameBlockSelfLoopWithBuffer",
+       localroute::TestSameBlockSelfLoopWithBuffer},
+      {"ExportRegionToSvgUtf8Path", localroute::TestExportRegionToSvgUtf8Path},
+      {"LocalNudgeThirdPartySegmentsLookup",
+       localroute::TestLocalNudgeThirdPartySegmentsLookup},
+      {"RestoreRouteEndpointValidation",
+       localroute::TestRestoreRouteEndpointValidation},
+      {"SpatialGridCrossRegionDuplicateCheck",
+       localroute::TestSpatialGridCrossRegionDuplicateCheck},
   };
   try {
     for (const auto& t : kCases) {

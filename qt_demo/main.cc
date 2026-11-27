@@ -223,6 +223,18 @@ int main(int argc, char* argv[]) {
     throw std::runtime_error(
         "smoke segment drag pushed unrelated neighbor wires");
   }
+  // Verify SetEnableChannelNudging(false) preserves user_modified routes.
+  canvas->SetEnableChannelNudging(false);
+  canvas->render(&scratch);
+  if (!canvas->router_view().route(3).user_modified ||
+      !canvas->router_view().route(4).user_modified ||
+      std::abs(canvas->router_view().route(3).points[1].x - 210.0) > 1e-6 ||
+      std::abs(canvas->router_view().route(4).points[1].x - 210.0) > 1e-6) {
+    throw std::runtime_error(
+        "smoke disabling channel nudging dropped user_modified routes");
+  }
+  canvas->SetEnableChannelNudging(true);
+  canvas->render(&scratch);
   // Dragging onto B11 obstacle (x=290) sets user_modified && kDisplayOnly.
   if (!canvas->StepSmokeSegmentDrag(3, 1, 290.0)) {
     throw std::runtime_error("smoke collision segment drag failed");
@@ -275,6 +287,20 @@ int main(int argc, char* argv[]) {
   }
   svg_file.close();
   QFile::remove(svg_tmp);
+
+  const QString svg_utf8_tmp =
+      QDir::tempPath() + QString::fromUtf8("/localroute_测试_🔌.svg");
+  QFile::remove(svg_utf8_tmp);
+  if (!canvas->ExportViewportSvg(svg_utf8_tmp)) {
+    throw std::runtime_error("smoke UTF-8 SVG export failed");
+  }
+  QFile svg_utf8_file(svg_utf8_tmp);
+  if (!svg_utf8_file.open(QIODevice::ReadOnly) ||
+      !svg_utf8_file.read(256).contains("<svg")) {
+    throw std::runtime_error("smoke UTF-8 SVG content invalid");
+  }
+  svg_utf8_file.close();
+  QFile::remove(svg_utf8_tmp);
 
   const std::string summary =
       std::string("SMOKE_PASS async_cold_route_ms=") +

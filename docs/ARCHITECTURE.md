@@ -97,9 +97,10 @@ qt_demo/
 
 为消除多条独立连线走中间通道时重合叠成单线（如平行对连母线、级联走廊重叠）的问题，系统在 `Config::enable_channel_nudging = true` 时于单次重算/冷启动末尾执行轻量级 $O(K \log K)$ 通道分轨（支持通过 `LocalOrthogonalRouter::set_enable_channel_nudging(bool)` 与 `AsyncLocalRouter::set_enable_channel_nudging(bool)` 运行时切换）：
 
-1. **活动线与只读锚定线严格隔离（`mutable_conns` vs Fixed Anchors）**：
-   * 全图冷启动（`RouteAllParallel` 合并后，`full_graph = true`）：全图 `Status::kValid` 且 `user_modified == false` 的连线属于可移动集，按确定性升序 `Id` 执行单趟全图等距分轨；凡 `user_modified == true` 的连线在全图与局部模式下均作为只读锚定轨道（Fixed Anchors），不被擅自挪动。
-   * 交互拖拽与局部编辑（`RerouteAffected`、`RouteConnector`、`AutoRouteConnectors` 及 `AsyncLocalRouter::Poll` 局部收口，`full_graph = false`）：仅本次重算且未锁定（`!user_modified`）的直连线集为 `mutable_conns`；`CollectParticipants()` **不再拼合整条路由的二维大 `union_box`**，而是按确定性升序 `Id` 遍历 `mutable_conns` 中 `Status::kValid && points.size() >= 4` 连线的各可移动中间段 `[1, pts.size() - 3]`，沿线段外扩 `max(2 * nudge_distance, 80.0)` 执行窄条空间查询（局部紧凑短段簇 `<= 32` 格合并一次 `Query()`，跨区短段按 `8` 条、超长段 `> 600 px` 按 `4` 条分批 `QueryUnion()`，达到参与上限 `cap = max(256, selected.size())` 即早停；仅收集不足 `16` 条时回退补查起止端点及邻接块）。查询到的邻近非关联连线及所有 `user_modified == true` 连线**仅作为只读占用轨道（Fixed Anchors）参与冲突检测与避让**，确保拖拽时非关联线与手调线 100% 静止。
+1. **活动线与只读锚定线严格隔离（`mutable_conns` vs Fixed Anchors）与局部尽力避让口径**：
+   * 全图冷启动（`RouteAllParallel` 合并后或 `AsyncLocalRouter::StartAll()` 全图波次收口，`full_graph = true`）：全图 `Status::kValid` 且 `user_modified == false` 的连线属于可移动集，按确定性升序 `Id` 执行单趟全图等距分轨，保证全局分轨收敛；凡 `user_modified == true` 的连线在全图与局部模式下均作为只读锚定轨道（Fixed Anchors），不被擅自挪动。
+   * 交互拖拽与局部编辑（`RerouteAffected`、`RouteConnector`、`AutoRouteConnectors` 及 `AsyncLocalRouter::Poll` 局部/优先波次，`full_graph = false`）：仅本次重算且未锁定（`!user_modified`）的直连线集为 `mutable_conns`。默认模式（`reroute_third_party_blocked = false`）不维护全局线段索引以保证零维护开销，`CollectParticipants()` 沿可移动中间段 `[1, pts.size() - 3]` 外扩 `max(2 * nudge_distance, 80.0)` 执行窄条空间查询（局部紧凑短段簇 `<= 32` 格合并一次 `Query()`，跨区短段按 `8` 条、超长段 `> 600 px` 按 `4` 条分批 `QueryUnion()`，达到参与上限 `cap = max(256, selected.size())` 即早停；仅收集不足 `16` 条时回退补查起止端点及邻接块），对局部窗口内邻接模块关联线及全部 `user_modified == true` 线做**尽力避让（best-effort）**（确保拖拽时非关联线与手调线 100% 静止；当 `reroute_third_party_blocked = true` 时，会复用已维护的 `segments_` 沿同批窄条补查穿行长线）。
+   * 启用 `reroute_third_party_blocked = true` 时，`LocalOrthogonalRouter` 通过显式旧索引计数表 `indexed_segment_counts_` 追踪每条连线实际写入 `segments_` 的段数，`ClearSegments()` 与 `ChannelNudger` 更新严格按旧记录清理，保证多段路径简化缩段或状态降级后索引零残留、零异常。
 2. **中间段与电气网表语义（`NetKey`）**：仅平移 `pts.size() >= 4` 连线的中间正交段（索引 `[1, pts.size() - 3]`），绝不篡改起止引脚位置与出线方向；按 `NetKey { src_block, src_pin }` 归组——**同一源引脚扇出允许共享主干，不同 `NetKey` 独立信号强制分轨**（同源固定线已存在时新扇出优先锚定其主干）。增量模式下若整个坐标带或冲突簇内不含可移动线段，直接整段跳过。
 3. **坐标带分桶 + 区间冲突聚类 + 宽通道弹性分轨**：分别处理垂直与水平中间段；冷启动按 `<= 1.5 px` 聚合共线坐标带，交互态按局部冲突阈值与跨度分簇。对纯活动组（含全图模式及无冲突固定线的局部组），结合障碍物膨胀框与同组线段实际起止引脚/邻点约束得到安全净宽 `avail = free_max - free_min`（`ComputeGroupFreeBounds` 通过 `bounded_both` 标记是否同时受左右/上下障碍或起止端点夹逼，防止无障碍或单侧开放通道被 `search_span` 虚高撑爆）：
    * 通道极窄（`avail < (M - 1) * nudge_distance`）时，保持紧凑压缩步长 `avail / (M + 1)`；
@@ -109,9 +110,9 @@ qt_demo/
 
 ### 3.5 异步会话模型（`AsyncLocalRouter`）
 
-* **双副本状态隔离**：主线程（Owner）仅操作 `model_`，后台工作线程独享一份独立的 `LocalOrthogonalRouter` 副本，彻底避免读写锁竞争或工作线程触碰 UI 数据。
+* **双副本状态隔离**：主线程（Owner）仅操作 `model_`，后台工作线程独享一份通过 `Clone()` 完整拷贝（含 `segments_` 及 `indexed_segment_counts_`）的 `LocalOrthogonalRouter` 副本；运行时调用 `set_reroute_third_party_blocked()` 亦会同步刷新后台 `snapshot` 的 `segments_` 索引，彻底避免读写锁竞争或双副本状态漂移。
 * **严格 FIFO 增量拓扑与拖动合并（`pending_ops_`）**：高频拖动调用 `Move()` 时，同模块位移合并覆盖到 `edits_`；当调用 `AddBlock`、`RemoveBlock`、`AddConnector`、`RemoveConnector`、`UpdateBlockPins`、`RestoreRoute`、`MoveRouteSegment` 或 `AutoRouteConnectors` 时，先经 `FlushCoalescedEditsLocked()` 将此前合并的 `edits_` 刷入有序队列 `pending_ops_` 末尾，再入队本次操作并递增 `generation_` 丢弃过期后台结果，确保双副本重放严格保序、零悬空 ID 竞态。
-* **视口优先与首屏分轨**：调用 `Prioritize(viewport, selection)` 后，后台队列优先处理选中块与可见区域内的连线；当当前视口 `priority_` 连线全部计算并出队后，不打断后台全图波次即在 Owner 侧先行触发一次局部 `ApplyChannelNudging()`，全图波次清空时再做最终收口。
+* **显式全图波次标志、视口优先与保序分轨回写**：`AsyncLocalRouter` 通过显式 `full_wave_pending_`（仅 `StartAll()` 置位）区分全图冷启动与大批量增量编辑，确保大批量局部增量编辑始终执行 `full_graph = false`（非关联线零位移）。调用 `Prioritize(viewport, selection)` 后，后台优先处理可见/选中连线；`Poll()` 在 `priority_wave_finished` 局部优先分轨及 `wave_finished` 收口分轨后，将发生位移的 `nudged` 路线以 `kSetRoute` 严格保序追加回 `pending_ops_`（优先分轨阶段不中断在途后台波次，全图收口时再触发唤醒同步），保证后续平移快路径与后台 `snapshot` 保持一致且旧分轨结果绝不覆盖新编辑。
 
 ### 3.6 局部焊点检测、无损端口更新与手动调线
 
@@ -119,7 +120,7 @@ qt_demo/
    * 纯只读局部查询接口（仅扫描调用方传入的当前视口可见连线子集，绝不扫描全图）：先过滤 `Status::kValid` 且点数 `>= 2` 的连线，按 `(src, sp)` 排序归组，对单线组直接零分配跳过。
    * 对多线同源组提取水平/垂直线段，检出三类电气分叉点（排除引脚起终点本身）：**T 型分叉点**（一方内顶点严格落在另一方线段内部）、**共享段分叉端点**（共线重叠区间端点处两条线朝不同方向离开）、**同源十字交点**（同源水平段与垂直段严格内部相交）；结果按 `1e-3` 容差去重。不同源（不同 `(src, sp)`）交叉绝不产生焊点。
 2. **原生无损端口更新与路径恢复（`UpdateBlockPins` / `RestoreRoute`）**：
-   * `UpdateBlockPins(block_id, new_rect, new_pins)` 原地更新模块包围盒与端口列表，自动移除失效引脚上的连线，对仍保留引脚上的连线**保持原 `conn_id` 与 `user_modified` 锁定状态**并置脏待重算；`RestoreRoute(conn_id, route)` 用于轻量增量 `Undo/Redo` 微秒级回放路径状态。
+   * `UpdateBlockPins(block_id, new_rect, new_pins)` 原地更新模块包围盒与端口列表，自动移除失效引脚上的连线，对仍保留引脚上的连线**保持原 `conn_id` 与 `user_modified` 锁定状态**并置脏待重算；`RestoreRoute(conn_id, route)` 用于轻量增量 `Undo/Redo` 微秒级回放路径状态，会对传入的 `Status::kValid` 快照执行 $O(1)$ 起止端点与当前 `PinPosition` 对齐校验（容差 `1e-6`，不对齐或点数 `< 2` 时自动降级为 `Status::kPending` 并置脏），在 `AsyncLocalRouter` 中恢复（或降级为）`Status::kPending` 时会保留/重入 `pending_` 等待异步收敛。
 3. **手动拖拽连线线段与同源主干随拖联动（`MoveRouteSegment`）**：
    * 拖动中间段（`1 <= seg_index <= pts.size() - 3`）时平移该段端点坐标，拖动 2 点直连或首/末段时自动插入正交折弯；同时自动查找同源 `(src, sp)` 兄弟连线中共线重叠的共享主干段同步平移并置 `user_modified = true`，保持 T 型焊点不断裂。
    * **禁止推动非关联线**：`MoveRouteSegment()` 与鼠标松手绝不触发 `ChannelNudger`，手调线严格停留在用户指定位置（撞障即置为 `Status::kDisplayOnly`），保证周边任意连线零扰动。
@@ -275,7 +276,7 @@ localroute::LocalOrthogonalRouter router(cfg, std::make_shared<CustomSolver>());
    * **视口裁剪、增量缓存与入线箭头**：通过 `view().QueryBlocks(viewport)` 做模块裁剪、增量维护 `route_cache_` 避免全图重建；`zoom >= 0.45` 时在目标端口绘制实心入线方向箭头（低缩放 LOD 自动剔除以保帧率）。
    * **同源焊点、交叉跳线弧与撞障警示**：`zoom >= 0.25` 时绘制同源分叉焊点圆点；`zoom >= 0.4` 且开启 `交叉跳线弧 (Hops)` 时绘制向上半圆跳线弧；手调线段碰撞障碍物（`user_modified && Status::kDisplayOnly`）时固定以红色虚线警示，常规兜底线默认深蓝渲染并支持 `高亮兜底线 (Debug)` 开关。
    * **多方式连线与主干随拖**：支持从端口圆点拉线，以及在已有信号线上 **`Ctrl+左键拖拽`** 直接分叉引出同源新分支；直接拖拽线段可平移线段并自动联动同源共享主干，拖拽过程支持向起止端口坐标直线吸附（`<= 5.0`，按住 `Alt` 取消），松手不推动任何旁路非关联线；点 `整理选中线 (Auto-route)` 恢复避障与分轨。
-   * **轻量增量 Undo/Redo 与建模操作**：支持 `Ctrl+Z / Ctrl+Y`（及工具栏按钮）基于轻量增量 `EditCommand` 回放移动、增删、改端口、手调线与 `Auto-route`（10k 规模 `< 1 ms`）；支持 `Ctrl+拖拽` 模块复制（`>= 5 px` 触发，保留 `Ctrl+点击` 多选）、端口对齐 Smart Guides、工具栏 `导出 SVG` 以及左侧图元库拖放、右键/面板动态修改端口数。
+   * **轻量增量 Undo/Redo 与建模操作**：支持 `Ctrl+Z / Ctrl+Y`（及工具栏按钮）基于轻量增量 `EditCommand` 回放移动、增删、改端口、手调线与 `Auto-route`（10k 规模 `< 1 ms`）；关闭分轨开关（`SetEnableChannelNudging(false)`）纯拓扑重建时自动收集并还原全部 `user_modified == true` 手调路线；所有 `AsyncLocalRouter::Poll` 调用点均具备异常捕获与定时器安全停止防护；支持 `Ctrl+拖拽` 模块复制（`>= 5 px` 触发，保留 `Ctrl+点击` 多选）、端口对齐 Smart Guides、工具栏 `导出 SVG`（Windows 下通过 `std::filesystem::u8path` 支持含中文与 Emoji 的 UTF-8 文件路径）以及左侧图元库拖放、右键/面板动态修改端口数。
    * **无黑框桌面启动**：Windows 下以 `WIN32` 子系统链接 `Qt5::WinMain`，双击不弹出控制台黑框；命令行传入 `--smoke-bench` 时自动通过 `AttachConsole(ATTACH_PARENT_PROCESS)` 恢复控制台/管道输出（并支持 `--smoke-out <path>`）。
 4. **近距模块缓冲**：若业务画布允许两个相连模块间距小于 `2 * cfg.buffer`（默认 `16 px`），建议将 `cfg.buffer` 调至 `4.0 ~ 6.0` 以减少缓冲框互叠导致的 `Status::kDisplayOnly` 退化。
 

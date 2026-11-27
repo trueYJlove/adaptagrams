@@ -48,6 +48,16 @@ if(LOCALROUTE_BUILD_TESTS)
         AsyncViewportPriorityNudge
         SharedTrunkSegmentDragNoNeighborPush
         ChannelNudgingElasticSpacing
+        SegmentIndexStateMachineAndShrink
+        AsyncThirdPartySegmentsSync
+        AsyncRestorePendingRouteConverges
+        AsyncLargeBatchZeroDisturbance
+        AsyncNudgeSyncBackAndPriorityRace
+        SameBlockSelfLoopWithBuffer
+        ExportRegionToSvgUtf8Path
+        LocalNudgeThirdPartySegmentsLookup
+        RestoreRouteEndpointValidation
+        SpatialGridCrossRegionDuplicateCheck
     )
         add_test(NAME local.${t} COMMAND test_unit ${t})
     endforeach()

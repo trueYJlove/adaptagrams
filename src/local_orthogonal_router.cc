@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
 #include <future>
 #include <locale>
@@ -444,15 +445,10 @@ void LocalOrthogonalRouter::set_reroute_third_party_blocked(bool enabled) {
   }
   cfg_.reroute_third_party_blocked = enabled;
   segments_ = SpatialGrid<std::uint64_t>(cfg_.cell);
+  indexed_segment_counts_.clear();
   if (enabled) {
     for (const auto& entry : routes_) {
-      if (entry.second.status == Status::kValid) {
-        for (size_t j = 1; j < entry.second.points.size(); ++j) {
-          segments_.Insert(
-              (static_cast<std::uint64_t>(entry.first) << 32) | j,
-              Box(entry.second.points[j - 1], entry.second.points[j]), true);
-        }
-      }
+      IndexSegments(entry.first, entry.second);
     }
   }
 }
@@ -675,27 +671,37 @@ void LocalOrthogonalRouter::InvalidateObstacle(Id block_id, Rect rect) {
 }
 
 void LocalOrthogonalRouter::ClearSegments(Id id) {
+  if (!cfg_.reroute_third_party_blocked && indexed_segment_counts_.empty()) {
+    return;
+  }
+  const auto it = indexed_segment_counts_.find(id);
+  if (it == indexed_segment_counts_.end()) {
+    return;
+  }
+  const std::size_t count = it->second;
+  for (std::size_t j = 1; j <= count; ++j) {
+    segments_.Remove((static_cast<std::uint64_t>(id) << 32) | j);
+  }
+  indexed_segment_counts_.erase(it);
+}
+
+void LocalOrthogonalRouter::IndexSegments(Id id, const Route& route) {
   if (!cfg_.reroute_third_party_blocked) {
     return;
   }
-  const auto it = routes_.find(id);
-  if (it != routes_.end() && it->second.method != RouteMethod::kNone) {
-    for (size_t j = 1; j < it->second.points.size(); ++j) {
-      segments_.Remove((static_cast<std::uint64_t>(id) << 32) | j);
+  ClearSegments(id);
+  if (route.status == Status::kValid && route.points.size() >= 2) {
+    const std::size_t seg_count = route.points.size() - 1;
+    for (std::size_t j = 1; j <= seg_count; ++j) {
+      segments_.Insert((static_cast<std::uint64_t>(id) << 32) | j,
+                       Box(route.points[j - 1], route.points[j]), true);
     }
+    indexed_segment_counts_[id] = seg_count;
   }
 }
 
 void LocalOrthogonalRouter::Publish(Id id, Route route) {
-  if (cfg_.reroute_third_party_blocked) {
-    ClearSegments(id);
-    if (route.status == Status::kValid) {
-      for (size_t j = 1; j < route.points.size(); ++j) {
-        segments_.Insert((static_cast<std::uint64_t>(id) << 32) | j,
-                         Box(route.points[j - 1], route.points[j]), true);
-      }
-    }
-  }
+  IndexSegments(id, route);
   routes_[id] = std::move(route);
   dirty_.erase(id);
 }
@@ -1107,8 +1113,28 @@ std::vector<Id> LocalOrthogonalRouter::UpdateBlockPins(
 }
 
 void LocalOrthogonalRouter::RestoreRoute(Id conn_id, Route route) {
-  (void)conns_.at(conn_id);
+  const Conn& c = conns_.at(conn_id);
+  if (route.status == Status::kValid) {
+    const auto& src = blocks_.at(c.src);
+    const auto& dst = blocks_.at(c.dst);
+    const Point a = PinPosition(src.rect, FindPin(src, c.sp));
+    const Point b = PinPosition(dst.rect, FindPin(dst, c.dp));
+    constexpr double kEndpointEps = 1e-6;
+    const bool aligned =
+        route.points.size() >= 2 &&
+        std::abs(route.points.front().x - a.x) <= kEndpointEps &&
+        std::abs(route.points.front().y - a.y) <= kEndpointEps &&
+        std::abs(route.points.back().x - b.x) <= kEndpointEps &&
+        std::abs(route.points.back().y - b.y) <= kEndpointEps;
+    if (!aligned) {
+      route.status = Status::kPending;
+    }
+  }
+  const bool mark_dirty = (route.status == Status::kPending);
   Publish(conn_id, std::move(route));
+  if (mark_dirty) {
+    dirty_.insert(conn_id);
+  }
 }
 
 bool LocalOrthogonalRouter::MoveRouteSegment(Id conn_id, std::size_t seg_index,
@@ -1749,7 +1775,7 @@ void LocalOrthogonalRouter::ExportRegionToSvg(
     const std::string& path, Rect viewport,
     const std::vector<Id>& highlight) const {
   CheckBox(viewport);
-  std::ofstream f(path);
+  std::ofstream f(std::filesystem::u8path(path));
   f.exceptions(std::ios::badbit | std::ios::failbit);
   f.imbue(std::locale::classic());
   f.precision(15);

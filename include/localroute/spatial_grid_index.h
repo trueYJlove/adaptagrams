@@ -30,11 +30,13 @@ class SpatialGrid {
 
   void Insert(Item id, Rect a, bool allow_overflow = false) {
     if (allow_overflow && GetRange(a).Count() > 1024) {
-      overflow_.emplace(id, a);
+      if (boxes_.count(id) || !overflow_.emplace(id, a).second) {
+        throw std::invalid_argument("duplicate block");
+      }
       return;
     }
     Check(a);
-    if (!boxes_.emplace(id, a).second) {
+    if (overflow_.count(id) || !boxes_.emplace(id, a).second) {
       throw std::invalid_argument("duplicate block");
     }
     Visit(GetRange(a), [&](Key k) { cells_[k].push_back(id); });

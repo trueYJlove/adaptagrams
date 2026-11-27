@@ -162,6 +162,9 @@ class CanvasWidget : public QWidget {
 
   const localroute::LocalOrthogonalRouter& ActiveView() const;
   void InstallInitialRouter(localroute::LocalOrthogonalRouter initial);
+  bool SafePollAsync(std::size_t max_results,
+                     std::vector<localroute::Id>* updated_ids,
+                     std::size_t* polled_count = nullptr);
   void PushUndoCommand(EditCommand cmd);
   void ApplyBlockMovesDelta(
       const std::vector<std::pair<localroute::Id, localroute::Rect>>& moves);

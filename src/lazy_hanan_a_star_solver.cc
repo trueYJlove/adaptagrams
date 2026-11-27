@@ -626,6 +626,12 @@ class LazyHananAStarSolverImpl final : public LocalRouteSolver {
       return std::abs(xs[x1] - xs[x0]) + std::abs(ys[y1] - ys[y0]);
     };
 
+    const bool same_block = (q.conn.src == q.conn.dst);
+    const std::uint8_t dst_escape_blk =
+        same_block ? kBlkOther : static_cast<std::uint8_t>(kBlkOther | kBlkSrc);
+    const std::uint8_t src_escape_blk =
+        same_block ? kBlkOther : static_cast<std::uint8_t>(kBlkOther | kBlkDst);
+
     EntryTarget entries[4];
     int num_entries = 0;
     for (int d_out_idx = 0; d_out_idx < 4; ++d_out_idx) {
@@ -647,7 +653,7 @@ class LazyHananAStarSolverImpl final : public LocalRouteSolver {
           break;
         }
         const std::uint8_t f = edge_flags(cx, cy, d_out_idx);
-        if (f & (kBlkOther | kBlkSrc)) {
+        if (f & dst_escape_blk) {
           break;
         }
         cost += step_length(cx, cy, nx, ny) +
@@ -722,7 +728,7 @@ class LazyHananAStarSolverImpl final : public LocalRouteSolver {
             break;
           }
           const std::uint8_t f = edge_flags(cx, cy, d0);
-          if (f & (kBlkOther | kBlkDst)) {
+          if (f & src_escape_blk) {
             break;
           }
           cost += step_length(cx, cy, nx, ny) +

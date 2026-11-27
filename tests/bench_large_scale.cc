@@ -302,8 +302,8 @@ int main(int argc, char** argv) {
       r.MoveBlocksBatch(moves);
       const auto changed = r.RerouteAffected(ids);
       times->push_back(ElapsedMs(tick));
-      if (!std::includes(changed.begin(), changed.end(), expected.begin(),
-                         expected.end())) {
+      if (changed.size() != expected.size() ||
+          !std::equal(changed.begin(), changed.end(), expected.begin())) {
         ++(*unexpected);
       }
       for (Id id : changed) {

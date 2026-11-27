@@ -91,6 +91,7 @@ class AsyncLocalRouter {
   bool pending_reroute_third_party_ = false;
   bool has_nudging_update_ = false;
   bool pending_enable_channel_nudging_ = true;
+  bool full_wave_pending_ = false;
   bool priority_nudged_ = false;
   std::set<Id> dirty_for_nudge_;
   std::set<Id> dirty_priority_for_nudge_;

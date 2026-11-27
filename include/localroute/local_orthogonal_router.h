@@ -33,6 +33,12 @@ class LocalOrthogonalRouter {
   void MarkConnector(Id id);
   std::vector<Id> UpdateBlockPins(Id block_id, Rect new_rect,
                                   std::vector<Pin> new_pins);
+  // Restores a route snapshot (e.g. for Undo/Redo). Precondition: conn_id
+  // exists in the router. If route.status == Status::kValid and route.points
+  // has fewer than 2 points or its endpoints do not align with the current
+  // source/destination PinPosition within 1e-6, it is downgraded to
+  // Status::kPending and marked dirty. Restoring Status::kPending also marks
+  // conn_id dirty.
   void RestoreRoute(Id conn_id, Route route);
   bool MoveRouteSegment(Id conn_id, std::size_t seg_index, double new_coord,
                         std::vector<Id>* changed_out = nullptr);
@@ -66,6 +72,7 @@ class LocalOrthogonalRouter {
   void Mark(Id id);
   void InvalidateObstacle(Id block_id, Rect rect);
   void ClearSegments(Id id);
+  void IndexSegments(Id id, const Route& route);
   void Publish(Id id, Route route);
   bool ValidateAndSimplifyRoute(const Conn& conn,
                                 std::vector<Point>* points) const;
@@ -86,6 +93,7 @@ class LocalOrthogonalRouter {
   std::unordered_map<Id, std::vector<Id>> adjacent_;
   std::unordered_map<Id, Route> routes_;
   SpatialGrid<std::uint64_t> segments_;
+  std::unordered_map<Id, std::size_t> indexed_segment_counts_;
   std::set<Id> dirty_;
 };
 

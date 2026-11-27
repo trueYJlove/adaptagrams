@@ -14,8 +14,10 @@
 #include <QPolygonF>
 #include <QVector>
 #include <QWheelEvent>
+#include <QtGlobal>
 #include <algorithm>
 #include <cmath>
+#include <exception>
 #include <limits>
 #include <utility>
 
@@ -163,6 +165,31 @@ void CanvasWidget::RefreshWorldBounds() {
   world_bounds_ = {min_x, min_y, max_x, max_y};
 }
 
+bool CanvasWidget::SafePollAsync(std::size_t max_results,
+                                 std::vector<localroute::Id>* updated_ids,
+                                 std::size_t* polled_count) {
+  if (polled_count) {
+    *polled_count = 0;
+  }
+  if (!async_router_) {
+    return false;
+  }
+  try {
+    const std::size_t n = async_router_->Poll(max_results, updated_ids);
+    if (polled_count) {
+      *polled_count = n;
+    }
+    return true;
+  } catch (const std::exception& e) {
+    async_timer_.stop();
+    qWarning("AsyncLocalRouter::Poll failed: %s", e.what());
+  } catch (...) {
+    async_timer_.stop();
+    qWarning("AsyncLocalRouter::Poll failed with unknown exception");
+  }
+  return false;
+}
+
 void CanvasWidget::PushUndoCommand(EditCommand cmd) {
   redo_stack_.clear();
   undo_stack_.push_back(std::move(cmd));
@@ -188,14 +215,15 @@ void CanvasWidget::ApplyBlockMovesDelta(
   } else if (mode_ == RouteMode::kAsync && async_router_) {
     async_router_->Move(moves);
     std::vector<localroute::Id> updated;
-    async_router_->Poll(128, &updated);
+    const bool poll_ok = SafePollAsync(128, &updated);
     for (localroute::Id id : ids) {
       UpdateRouteBoundsFromBlock(id);
     }
     if (!updated.empty()) {
       UpdateRouteCacheForIds(updated);
     }
-    if (!async_timer_.isActive() && async_router_->PendingCount() > 0) {
+    if (poll_ok && !async_timer_.isActive() &&
+        async_router_->PendingCount() > 0) {
       async_timer_.start();
     }
   }
@@ -509,9 +537,18 @@ void CanvasWidget::SetEnableChannelNudging(bool enabled) {
   redo_stack_.clear();
   if (!enabled) {
     // Rebuild from empty routes so previously nudged middle segments do not
-    // persist via zero-displacement translation reuse.
+    // persist via zero-displacement translation reuse, while preserving
+    // hand-edited (user_modified) routes.
     async_timer_.stop();
     const auto& cur = ActiveView();
+    std::vector<std::pair<localroute::Id, localroute::Route>> user_routes;
+    for (const auto& kv : cur.all_routes()) {
+      if (kv.second.user_modified &&
+          kv.second.status != localroute::Status::kPending &&
+          kv.second.points.size() >= 2) {
+        user_routes.emplace_back(kv.first, kv.second);
+      }
+    }
     localroute::Config cfg = cur.config();
     cfg.reroute_third_party_blocked = third_party_reroute_;
     cfg.enable_channel_nudging = false;
@@ -531,6 +568,9 @@ void CanvasWidget::SetEnableChannelNudging(bool enabled) {
       sync_router_ =
           std::make_unique<localroute::LocalOrthogonalRouter>(std::move(fresh));
       sync_router_->RouteAllParallel();
+      for (const auto& kv : user_routes) {
+        sync_router_->RestoreRoute(kv.first, kv.second);
+      }
       route_time_ms_ = static_cast<double>(timer.nsecsElapsed()) / 1e6;
     } else {
       async_router_ =
@@ -540,6 +580,9 @@ void CanvasWidget::SetEnableChannelNudging(bool enabled) {
           std::vector<localroute::Id>(selected_blocks_.begin(),
                                       selected_blocks_.end()));
       async_router_->StartAll();
+      for (const auto& kv : user_routes) {
+        async_router_->RestoreRoute(kv.first, kv.second);
+      }
       route_time_ms_ = static_cast<double>(timer.nsecsElapsed()) / 1e6;
       if (async_router_->PendingCount() > 0) {
         async_timer_.start();
@@ -1662,7 +1705,11 @@ void CanvasWidget::OnAsyncTick() {
   std::vector<localroute::Id> updated;
   QElapsedTimer timer;
   timer.start();
-  const std::size_t n = async_router_->Poll(batch_size, &updated);
+  std::size_t n = 0;
+  if (!SafePollAsync(batch_size, &updated, &n)) {
+    emit StatusChanged();
+    return;
+  }
   const double poll_ms = static_cast<double>(timer.nsecsElapsed()) / 1e6;
   if (n > 0) {
     if (drag_kind_ != DragKind::kMoveBlocks) {
@@ -2192,7 +2239,7 @@ void CanvasWidget::mouseMoveEvent(QMouseEvent* event) {
     } else if (mode_ == RouteMode::kAsync && async_router_) {
       async_router_->Move(moves);
       std::vector<localroute::Id> updated;
-      async_router_->Poll(128, &updated);
+      const bool poll_ok = SafePollAsync(128, &updated);
       route_time_ms_ = static_cast<double>(timer.nsecsElapsed()) / 1e6;
       for (localroute::Id id : moved_ids) {
         UpdateRouteBoundsFromBlock(id);
@@ -2200,7 +2247,7 @@ void CanvasWidget::mouseMoveEvent(QMouseEvent* event) {
       if (!updated.empty()) {
         UpdateRouteCacheForIds(updated);
       }
-      if (!async_timer_.isActive()) {
+      if (poll_ok && !async_timer_.isActive()) {
         async_timer_.start();
       }
     }
