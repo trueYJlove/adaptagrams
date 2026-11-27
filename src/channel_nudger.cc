@@ -730,9 +730,10 @@ void NudgeAxis(
                            std::tie(b.shape_class, b.order_key, b.net);
                   });
 
-        const double search_span = std::max(
-            static_cast<double>(all_groups.size()) * cfg.nudge_distance * 1.5,
-            120.0);
+        const double search_span =
+            std::max(static_cast<double>(all_groups.size()) *
+                         cfg.max_nudge_distance * 1.1,
+                     120.0);
 
         bool can_use_balanced = (mutable_groups.size() >= 2);
         if (can_use_balanced && !full_graph) {

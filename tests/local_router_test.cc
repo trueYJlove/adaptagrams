@@ -1090,13 +1090,13 @@ void TestChannelNudgingElasticSpacing() {
   CHECK(narrow_min > 4.0);
   CHECK(narrow_max < cfg.nudge_distance);
 
-  // Wide corridor (600 px gap): elastically expands > nudge_distance and
-  // <= max_nudge_distance with 0 overlaps and 0 crossings.
+  // Wide corridor (600 px gap): elastically expands strictly to
+  // max_nudge_distance (24 px) with 0 overlaps and 0 crossings.
   const std::vector<double> wide_gaps = run_bundle(680.0);
   const double wide_min = *std::min_element(wide_gaps.begin(), wide_gaps.end());
   const double wide_max = *std::max_element(wide_gaps.begin(), wide_gaps.end());
-  CHECK(wide_min > cfg.nudge_distance + 1.0);
-  CHECK(wide_max <= cfg.max_nudge_distance + 1e-6);
+  CHECK(std::abs(wide_min - cfg.max_nudge_distance) <= 1e-3);
+  CHECK(std::abs(wide_max - cfg.max_nudge_distance) <= 1e-3);
   CHECK(wide_min > narrow_max);
 }
 
