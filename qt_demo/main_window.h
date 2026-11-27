@@ -27,6 +27,9 @@ class MainWindow : public QMainWindow {
   void OnHighlightFallbackToggled(bool checked);
   void OnLineHopsToggled(bool checked);
   void OnAutoRouteClicked();
+  void OnUndoClicked();
+  void OnRedoClicked();
+  void OnExportSvgClicked();
   void OnClearCanvas();
   void OnPortSpinChanged();
   void SyncInspectorFromSelection();
@@ -44,6 +47,8 @@ class MainWindow : public QMainWindow {
   QCheckBox* highlight_fallback_check_ = nullptr;
   QCheckBox* hops_check_ = nullptr;
   QPushButton* auto_route_btn_ = nullptr;
+  QPushButton* undo_btn_ = nullptr;
+  QPushButton* redo_btn_ = nullptr;
 
   // Inspector controls
   QLabel* sel_title_label_ = nullptr;

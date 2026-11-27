@@ -11,6 +11,7 @@
 #include <QMimeData>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QPolygonF>
 #include <QVector>
 #include <QWheelEvent>
 #include <algorithm>
@@ -162,49 +163,123 @@ void CanvasWidget::RefreshWorldBounds() {
   world_bounds_ = {min_x, min_y, max_x, max_y};
 }
 
-void CanvasWidget::ApplyModelEdit(
-    const std::function<std::vector<localroute::Id>(
-        localroute::LocalOrthogonalRouter*)>& edit_fn) {
-  QElapsedTimer timer;
-  timer.start();
+void CanvasWidget::PushUndoCommand(EditCommand cmd) {
+  redo_stack_.clear();
+  undo_stack_.push_back(std::move(cmd));
+  while (undo_stack_.size() > 100) {
+    undo_stack_.pop_front();
+  }
+}
+
+void CanvasWidget::ApplyBlockMovesDelta(
+    const std::vector<std::pair<localroute::Id, localroute::Rect>>& moves) {
+  if (moves.empty()) {
+    return;
+  }
+  std::vector<localroute::Id> ids;
+  ids.reserve(moves.size());
+  for (const auto& m : moves) {
+    ids.push_back(m.first);
+  }
   if (mode_ == RouteMode::kSync && sync_router_) {
-    const std::vector<localroute::Id> route_conn_ids =
-        edit_fn(sync_router_.get());
-    for (localroute::Id cid : route_conn_ids) {
-      if (sync_router_->all_conns().count(cid)) {
-        sync_router_->RouteConnector(cid);
-      }
-    }
-    (void)sync_router_->RerouteAffected({});
-    route_time_ms_ = static_cast<double>(timer.nsecsElapsed()) / 1e6;
+    sync_router_->MoveBlocksBatch(moves);
+    const auto changed = sync_router_->RerouteAffected(ids, true);
+    UpdateRouteCacheForIds(changed);
   } else if (mode_ == RouteMode::kAsync && async_router_) {
-    async_timer_.stop();
-    localroute::LocalOrthogonalRouter model = async_router_->view().Clone();
-    async_router_.reset();
-    const std::vector<localroute::Id> route_conn_ids = edit_fn(&model);
-    for (localroute::Id cid : route_conn_ids) {
-      if (model.all_conns().count(cid)) {
-        model.MarkConnector(cid);
-      }
+    async_router_->Move(moves);
+    std::vector<localroute::Id> updated;
+    async_router_->Poll(128, &updated);
+    for (localroute::Id id : ids) {
+      UpdateRouteBoundsFromBlock(id);
     }
-    async_router_ =
-        std::make_unique<localroute::AsyncLocalRouter>(std::move(model));
-    async_router_->Prioritize(WorldViewportRect(), std::vector<localroute::Id>(
-                                                       selected_blocks_.begin(),
-                                                       selected_blocks_.end()));
-    async_router_->StartDirty();
-    route_time_ms_ = static_cast<double>(timer.nsecsElapsed()) / 1e6;
-    if (async_router_->PendingCount() > 0) {
+    if (!updated.empty()) {
+      UpdateRouteCacheForIds(updated);
+    }
+    if (!async_timer_.isActive() && async_router_->PendingCount() > 0) {
       async_timer_.start();
     }
   }
+}
 
-  current_block_count_ =
-      static_cast<unsigned>(ActiveView().all_blocks().size());
-  current_conn_count_ = static_cast<unsigned>(ActiveView().all_conns().size());
+void CanvasWidget::AddBlockIncremental(localroute::Block blk) {
+  if (mode_ == RouteMode::kSync && sync_router_) {
+    sync_router_->AddBlock(std::move(blk));
+    const auto changed = sync_router_->RerouteAffected({});
+    UpdateRouteCacheForIds(changed);
+  } else if (mode_ == RouteMode::kAsync && async_router_) {
+    async_router_->AddBlock(std::move(blk));
+    if (!async_timer_.isActive() && async_router_->PendingCount() > 0) {
+      async_timer_.start();
+    }
+  }
+}
+
+void CanvasWidget::RemoveBlockIncremental(localroute::Id bid) {
+  std::vector<localroute::Id> removed_conns;
+  if (ActiveView().all_blocks().count(bid)) {
+    removed_conns = ActiveView().adjacent_conns(bid);
+  }
+  if (mode_ == RouteMode::kSync && sync_router_) {
+    if (sync_router_->all_blocks().count(bid)) {
+      sync_router_->RemoveBlock(bid);
+    }
+  } else if (mode_ == RouteMode::kAsync && async_router_) {
+    if (async_router_->view().all_blocks().count(bid)) {
+      async_router_->RemoveBlock(bid);
+    }
+  }
+  for (localroute::Id cid : removed_conns) {
+    RemoveRouteCacheEntry(cid);
+  }
+}
+
+void CanvasWidget::AddConnectorIncremental(localroute::Conn conn,
+                                           const localroute::Route* opt_route) {
+  const localroute::Id cid = conn.id;
+  if (mode_ == RouteMode::kSync && sync_router_) {
+    sync_router_->AddConnector(conn);
+    if (opt_route != nullptr &&
+        opt_route->status != localroute::Status::kPending &&
+        !opt_route->points.empty()) {
+      sync_router_->RestoreRoute(cid, *opt_route);
+    } else {
+      sync_router_->RouteConnector(cid);
+    }
+  } else if (mode_ == RouteMode::kAsync && async_router_) {
+    async_router_->AddConnector(conn);
+    if (opt_route != nullptr &&
+        opt_route->status != localroute::Status::kPending &&
+        !opt_route->points.empty()) {
+      async_router_->RestoreRoute(cid, *opt_route);
+    } else if (!async_timer_.isActive() && async_router_->PendingCount() > 0) {
+      async_timer_.start();
+    }
+  }
+  AddRouteCacheEntry(cid);
+}
+
+void CanvasWidget::RemoveConnectorIncremental(localroute::Id cid) {
+  if (mode_ == RouteMode::kSync && sync_router_) {
+    if (sync_router_->all_conns().count(cid)) {
+      sync_router_->RemoveConnector(cid);
+    }
+  } else if (mode_ == RouteMode::kAsync && async_router_) {
+    if (async_router_->view().all_conns().count(cid)) {
+      async_router_->RemoveConnector(cid);
+    }
+  }
+  RemoveRouteCacheEntry(cid);
+}
+
+void CanvasWidget::RefreshAfterIncrementalEdit() {
+  const auto& view = ActiveView();
+  current_block_count_ = static_cast<unsigned>(view.all_blocks().size());
+  current_conn_count_ = static_cast<unsigned>(view.all_conns().size());
   RefreshWorldBounds();
-  RecordRouteSample(route_time_ms_);
-  RebuildRouteCache();
+  if (mode_ == RouteMode::kAsync && async_router_ &&
+      async_router_->PendingCount() > 0 && !async_timer_.isActive()) {
+    async_timer_.start();
+  }
   update();
   emit StatusChanged();
   emit SelectionChanged();
@@ -212,6 +287,12 @@ void CanvasWidget::ApplyModelEdit(
 
 void CanvasWidget::InstallInitialRouter(
     localroute::LocalOrthogonalRouter initial) {
+  undo_stack_.clear();
+  redo_stack_.clear();
+  ctrl_dup_armed_ = false;
+  has_pending_dup_cmd_ = false;
+  seg_drag_before_routes_.clear();
+
   current_block_count_ = static_cast<unsigned>(initial.all_blocks().size());
   current_conn_count_ = static_cast<unsigned>(initial.all_conns().size());
 
@@ -272,6 +353,11 @@ void CanvasWidget::LoadTopology(unsigned block_count) {
   active_guides_.clear();
   drag_seg_conn_id_ = 0;
   drag_seg_index_ = 0;
+  ctrl_dup_armed_ = false;
+  has_pending_dup_cmd_ = false;
+  seg_drag_before_routes_.clear();
+  undo_stack_.clear();
+  redo_stack_.clear();
   route_samples_ms_.clear();
   drag_kind_ = DragKind::kNone;
 
@@ -366,6 +452,8 @@ void CanvasWidget::SetRouteMode(RouteMode new_mode) {
   if (mode_ == new_mode) {
     return;
   }
+  undo_stack_.clear();
+  redo_stack_.clear();
   async_timer_.stop();
   localroute::LocalOrthogonalRouter model = ActiveView().Clone();
   model.set_reroute_third_party_blocked(third_party_reroute_);
@@ -417,6 +505,8 @@ void CanvasWidget::SetEnableChannelNudging(bool enabled) {
     return;
   }
   channel_nudging_ = enabled;
+  undo_stack_.clear();
+  redo_stack_.clear();
   if (!enabled) {
     // Rebuild from empty routes so previously nudged middle segments do not
     // persist via zero-displacement translation reuse.
@@ -503,6 +593,15 @@ std::vector<localroute::Id> CanvasWidget::AutoRouteSelection() {
   std::sort(targets.begin(), targets.end());
   targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
 
+  EditCommand cmd;
+  cmd.kind = EditCommand::Kind::kModifyRoutes;
+  const auto& prev_routes = view.all_routes();
+  for (localroute::Id cid : targets) {
+    if (const auto it = prev_routes.find(cid); it != prev_routes.end()) {
+      cmd.before_routes.emplace_back(cid, it->second);
+    }
+  }
+
   QElapsedTimer timer;
   timer.start();
   std::vector<localroute::Id> changed;
@@ -513,10 +612,251 @@ std::vector<localroute::Id> CanvasWidget::AutoRouteSelection() {
   }
   route_time_ms_ = static_cast<double>(timer.nsecsElapsed()) / 1e6;
   RecordRouteSample(route_time_ms_);
+
+  // Capture any extra nudged connections in before_routes (if missing, record
+  // changed routes cleanly so Undo restores every modified route).
+  const auto& new_routes = ActiveView().all_routes();
+  for (localroute::Id cid : changed) {
+    if (const auto it = new_routes.find(cid); it != new_routes.end()) {
+      cmd.after_routes.emplace_back(cid, it->second);
+    }
+  }
+  if (!cmd.before_routes.empty() && !cmd.after_routes.empty()) {
+    PushUndoCommand(std::move(cmd));
+  }
+
   UpdateRouteCacheForIds(changed);
   update();
   emit StatusChanged();
   return changed;
+}
+
+bool CanvasWidget::ExportViewportSvg(const QString& path) const {
+  if (path.isEmpty()) {
+    return false;
+  }
+  try {
+    std::vector<localroute::Id> hi(highlighted_conns_.begin(),
+                                   highlighted_conns_.end());
+    ActiveView().ExportRegionToSvg(path.toStdString(), WorldViewportRect(), hi);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+bool CanvasWidget::Undo() {
+  if (undo_stack_.empty()) {
+    return false;
+  }
+  EditCommand cmd = std::move(undo_stack_.back());
+  undo_stack_.pop_back();
+
+  QElapsedTimer timer;
+  timer.start();
+  const auto& view = ActiveView();
+  switch (cmd.kind) {
+    case EditCommand::Kind::kMoveBlocks: {
+      std::vector<std::pair<localroute::Id, localroute::Rect>> live;
+      for (const auto& kv : cmd.before_rects) {
+        if (view.all_blocks().count(kv.first)) {
+          live.push_back(kv);
+        }
+      }
+      ApplyBlockMovesDelta(live);
+      break;
+    }
+    case EditCommand::Kind::kAddItems: {
+      if (cmd.after_routes.empty()) {
+        for (const auto& c : cmd.conns) {
+          if (const auto rit = view.all_routes().find(c.id);
+              rit != view.all_routes().end()) {
+            cmd.after_routes.emplace_back(c.id, rit->second);
+          }
+        }
+      }
+      for (const auto& c : cmd.conns) {
+        selected_conn_id_ = (selected_conn_id_ == c.id) ? 0 : selected_conn_id_;
+        highlighted_conns_.erase(c.id);
+        RemoveConnectorIncremental(c.id);
+      }
+      has_selected_conn_ = highlighted_conns_.count(selected_conn_id_) != 0;
+      for (const auto& b : cmd.blocks) {
+        selected_blocks_.erase(b.id);
+        RemoveBlockIncremental(b.id);
+      }
+      break;
+    }
+    case EditCommand::Kind::kDeleteItems: {
+      for (const auto& b : cmd.blocks) {
+        AddBlockIncremental(b);
+      }
+      std::unordered_map<localroute::Id, const localroute::Route*> saved;
+      for (const auto& kv : cmd.before_routes) {
+        saved.emplace(kv.first, &kv.second);
+      }
+      for (const auto& c : cmd.conns) {
+        const auto sit = saved.find(c.id);
+        AddConnectorIncremental(c, sit != saved.end() ? sit->second : nullptr);
+      }
+      break;
+    }
+    case EditCommand::Kind::kUpdatePins: {
+      if (view.all_blocks().count(cmd.pin_block_id)) {
+        std::vector<localroute::Id> surviving;
+        if (mode_ == RouteMode::kSync && sync_router_) {
+          surviving = sync_router_->UpdateBlockPins(cmd.pin_block_id,
+                                                    cmd.old_rect, cmd.old_pins);
+        } else if (mode_ == RouteMode::kAsync && async_router_) {
+          surviving = async_router_->UpdateBlockPins(
+              cmd.pin_block_id, cmd.old_rect, cmd.old_pins);
+        }
+        std::unordered_map<localroute::Id, const localroute::Route*> saved;
+        for (const auto& kv : cmd.before_routes) {
+          saved.emplace(kv.first, &kv.second);
+        }
+        for (const auto& c : cmd.conns) {
+          const auto sit = saved.find(c.id);
+          AddConnectorIncremental(c,
+                                  sit != saved.end() ? sit->second : nullptr);
+        }
+        std::vector<localroute::Id> restored_ids = surviving;
+        for (localroute::Id cid : surviving) {
+          if (const auto sit = saved.find(cid);
+              sit != saved.end() &&
+              sit->second->status != localroute::Status::kPending &&
+              !sit->second->points.empty()) {
+            if (mode_ == RouteMode::kSync && sync_router_) {
+              sync_router_->RestoreRoute(cid, *sit->second);
+            } else if (mode_ == RouteMode::kAsync && async_router_) {
+              async_router_->RestoreRoute(cid, *sit->second);
+            }
+          } else if (mode_ == RouteMode::kSync && sync_router_) {
+            sync_router_->RouteConnector(cid);
+          }
+        }
+        UpdateRouteCacheForIds(restored_ids);
+      }
+      break;
+    }
+    case EditCommand::Kind::kModifyRoutes: {
+      std::vector<localroute::Id> ids;
+      ids.reserve(cmd.before_routes.size());
+      for (const auto& kv : cmd.before_routes) {
+        if (!ActiveView().all_conns().count(kv.first)) {
+          continue;
+        }
+        if (mode_ == RouteMode::kSync && sync_router_) {
+          sync_router_->RestoreRoute(kv.first, kv.second);
+        } else if (mode_ == RouteMode::kAsync && async_router_) {
+          async_router_->RestoreRoute(kv.first, kv.second);
+        }
+        ids.push_back(kv.first);
+      }
+      UpdateRouteCacheForIds(ids);
+      break;
+    }
+  }
+
+  route_time_ms_ = static_cast<double>(timer.nsecsElapsed()) / 1e6;
+  RecordRouteSample(route_time_ms_);
+  redo_stack_.push_back(std::move(cmd));
+  RefreshAfterIncrementalEdit();
+  return true;
+}
+
+bool CanvasWidget::Redo() {
+  if (redo_stack_.empty()) {
+    return false;
+  }
+  EditCommand cmd = std::move(redo_stack_.back());
+  redo_stack_.pop_back();
+
+  QElapsedTimer timer;
+  timer.start();
+  const auto& view = ActiveView();
+  switch (cmd.kind) {
+    case EditCommand::Kind::kMoveBlocks: {
+      std::vector<std::pair<localroute::Id, localroute::Rect>> live;
+      for (const auto& kv : cmd.after_rects) {
+        if (view.all_blocks().count(kv.first)) {
+          live.push_back(kv);
+        }
+      }
+      ApplyBlockMovesDelta(live);
+      break;
+    }
+    case EditCommand::Kind::kAddItems: {
+      for (const auto& b : cmd.blocks) {
+        AddBlockIncremental(b);
+      }
+      std::unordered_map<localroute::Id, const localroute::Route*> saved;
+      for (const auto& kv : cmd.after_routes) {
+        saved.emplace(kv.first, &kv.second);
+      }
+      for (const auto& c : cmd.conns) {
+        const auto sit = saved.find(c.id);
+        AddConnectorIncremental(c, sit != saved.end() ? sit->second : nullptr);
+      }
+      break;
+    }
+    case EditCommand::Kind::kDeleteItems: {
+      for (const auto& c : cmd.conns) {
+        RemoveConnectorIncremental(c.id);
+      }
+      for (const auto& b : cmd.blocks) {
+        selected_blocks_.erase(b.id);
+        RemoveBlockIncremental(b.id);
+      }
+      break;
+    }
+    case EditCommand::Kind::kUpdatePins: {
+      if (view.all_blocks().count(cmd.pin_block_id)) {
+        std::vector<localroute::Id> surviving;
+        if (mode_ == RouteMode::kSync && sync_router_) {
+          surviving = sync_router_->UpdateBlockPins(cmd.pin_block_id,
+                                                    cmd.new_rect, cmd.new_pins);
+          const auto changed =
+              sync_router_->RerouteAffected({cmd.pin_block_id});
+          UpdateRouteCacheForIds(changed);
+        } else if (mode_ == RouteMode::kAsync && async_router_) {
+          surviving = async_router_->UpdateBlockPins(
+              cmd.pin_block_id, cmd.new_rect, cmd.new_pins);
+          UpdateRouteCacheForIds(surviving);
+        }
+        for (const auto& c : cmd.conns) {
+          RemoveRouteCacheEntry(c.id);
+        }
+      }
+      break;
+    }
+    case EditCommand::Kind::kModifyRoutes: {
+      std::vector<localroute::Id> ids;
+      ids.reserve(cmd.after_routes.size());
+      for (const auto& kv : cmd.after_routes) {
+        if (!ActiveView().all_conns().count(kv.first)) {
+          continue;
+        }
+        if (mode_ == RouteMode::kSync && sync_router_) {
+          sync_router_->RestoreRoute(kv.first, kv.second);
+        } else if (mode_ == RouteMode::kAsync && async_router_) {
+          async_router_->RestoreRoute(kv.first, kv.second);
+        }
+        ids.push_back(kv.first);
+      }
+      UpdateRouteCacheForIds(ids);
+      break;
+    }
+  }
+
+  route_time_ms_ = static_cast<double>(timer.nsecsElapsed()) / 1e6;
+  RecordRouteSample(route_time_ms_);
+  undo_stack_.push_back(std::move(cmd));
+  while (undo_stack_.size() > 100) {
+    undo_stack_.pop_front();
+  }
+  RefreshAfterIncrementalEdit();
+  return true;
 }
 
 void CanvasWidget::RouteAll() {
@@ -597,10 +937,16 @@ localroute::Id CanvasWidget::AddBlockFromTemplate(const BlockTemplate& tmpl,
   has_selected_conn_ = false;
   highlighted_conns_.clear();
 
-  ApplyModelEdit([blk = std::move(blk)](localroute::LocalOrthogonalRouter* r) {
-    r->AddBlock(blk);
-    return std::vector<localroute::Id>{};
-  });
+  QElapsedTimer timer;
+  timer.start();
+  EditCommand cmd;
+  cmd.kind = EditCommand::Kind::kAddItems;
+  cmd.blocks.push_back(blk);
+  AddBlockIncremental(std::move(blk));
+  route_time_ms_ = static_cast<double>(timer.nsecsElapsed()) / 1e6;
+  RecordRouteSample(route_time_ms_);
+  PushUndoCommand(std::move(cmd));
+  RefreshAfterIncrementalEdit();
   return new_id;
 }
 
@@ -681,87 +1027,73 @@ void CanvasWidget::SetBlockPorts(localroute::Id block_id, int left, int right,
     return;
   }
 
-  ApplyModelEdit([&](localroute::LocalOrthogonalRouter* r) {
-    const localroute::Block old_blk = r->block(block_id);
+  const localroute::Block old_blk = view.block(block_id);
+  const double cur_w = old_blk.rect.r - old_blk.rect.l;
+  const double cur_h = old_blk.rect.b - old_blk.rect.t;
+  const double cx = (old_blk.rect.l + old_blk.rect.r) * 0.5;
+  const double cy = (old_blk.rect.t + old_blk.rect.b) * 0.5;
+  const double new_h = std::max(cur_h, std::max(left, right) * 20.0 + 16.0);
+  const double new_w = std::max(cur_w, std::max(top, bottom) * 24.0 + 20.0);
+  const localroute::Rect new_rect{cx - new_w * 0.5, cy - new_h * 0.5,
+                                  cx + new_w * 0.5, cy + new_h * 0.5};
+  std::vector<localroute::Pin> new_pins =
+      BuildPinsForCounts(left, right, top, bottom);
+  std::unordered_set<localroute::Id> new_pin_ids;
+  for (const auto& p : new_pins) {
+    new_pin_ids.insert(p.id);
+  }
 
-    std::array<std::vector<localroute::Pin>, 4> old_by_side;
-    for (const auto& p : old_blk.pins) {
-      old_by_side[static_cast<int>(ClassifyPinSide(p))].push_back(p);
+  EditCommand cmd;
+  cmd.kind = EditCommand::Kind::kUpdatePins;
+  cmd.pin_block_id = block_id;
+  cmd.old_rect = old_blk.rect;
+  cmd.new_rect = new_rect;
+  cmd.old_pins = old_blk.pins;
+  cmd.new_pins = new_pins;
+
+  std::vector<localroute::Id> removed_cids;
+  const auto& all_conns = view.all_conns();
+  const auto& all_routes = view.all_routes();
+  for (localroute::Id cid : view.adjacent_conns(block_id)) {
+    const auto cit = all_conns.find(cid);
+    if (cit == all_conns.end()) {
+      continue;
     }
-    auto sort_y = [](const localroute::Pin& a, const localroute::Pin& b) {
-      return a.y != b.y ? a.y < b.y : a.id < b.id;
-    };
-    auto sort_x = [](const localroute::Pin& a, const localroute::Pin& b) {
-      return a.x != b.x ? a.x < b.x : a.id < b.id;
-    };
-    std::sort(old_by_side[0].begin(), old_by_side[0].end(), sort_y);
-    std::sort(old_by_side[1].begin(), old_by_side[1].end(), sort_y);
-    std::sort(old_by_side[2].begin(), old_by_side[2].end(), sort_x);
-    std::sort(old_by_side[3].begin(), old_by_side[3].end(), sort_x);
-
-    const int new_counts[4] = {left, right, top, bottom};
-    const localroute::Id side_base[4] = {100, 200, 300, 400};
-    std::unordered_map<localroute::Id, localroute::Id> pin_remap;
-    for (int s = 0; s < 4; ++s) {
-      const int keep =
-          std::min(new_counts[s], static_cast<int>(old_by_side[s].size()));
-      for (int i = 0; i < keep; ++i) {
-        pin_remap.emplace(old_by_side[s][i].id,
-                          side_base[s] + static_cast<localroute::Id>(i));
-      }
+    const localroute::Conn& c = cit->second;
+    if (const auto rit = all_routes.find(cid); rit != all_routes.end()) {
+      cmd.before_routes.emplace_back(cid, rit->second);
     }
-
-    std::vector<localroute::Conn> preserved_conns;
-    for (localroute::Id cid : r->adjacent_conns(block_id)) {
-      localroute::Conn c = r->all_conns().at(cid);
-      bool keep = true;
-      if (c.src == block_id) {
-        const auto it = pin_remap.find(c.sp);
-        if (it == pin_remap.end()) {
-          keep = false;
-        } else {
-          c.sp = it->second;
-        }
-      }
-      if (keep && c.dst == block_id) {
-        const auto it = pin_remap.find(c.dp);
-        if (it == pin_remap.end()) {
-          keep = false;
-        } else {
-          c.dp = it->second;
-        }
-      }
-      if (keep) {
-        preserved_conns.push_back(c);
-      }
+    if ((c.src == block_id && !new_pin_ids.count(c.sp)) ||
+        (c.dst == block_id && !new_pin_ids.count(c.dp))) {
+      cmd.conns.push_back(c);
+      removed_cids.push_back(cid);
     }
+  }
 
-    const double cur_w = old_blk.rect.r - old_blk.rect.l;
-    const double cur_h = old_blk.rect.b - old_blk.rect.t;
-    const double cx = (old_blk.rect.l + old_blk.rect.r) * 0.5;
-    const double cy = (old_blk.rect.t + old_blk.rect.b) * 0.5;
-    const double new_h = std::max(cur_h, std::max(left, right) * 20.0 + 16.0);
-    const double new_w = std::max(cur_w, std::max(top, bottom) * 24.0 + 20.0);
-    const localroute::Rect new_rect{cx - new_w * 0.5, cy - new_h * 0.5,
-                                    cx + new_w * 0.5, cy + new_h * 0.5};
-
-    r->RemoveBlock(block_id);
-    r->AddBlock(
-        {block_id, new_rect, BuildPinsForCounts(left, right, top, bottom)});
-    std::vector<localroute::Id> to_route;
-    to_route.reserve(preserved_conns.size());
-    for (const auto& c : preserved_conns) {
-      r->AddConnector(c);
-      to_route.push_back(c.id);
-    }
-    return to_route;
-  });
+  QElapsedTimer timer;
+  timer.start();
+  if (mode_ == RouteMode::kSync && sync_router_) {
+    (void)sync_router_->UpdateBlockPins(block_id, new_rect,
+                                        std::move(new_pins));
+    const auto changed = sync_router_->RerouteAffected({block_id});
+    UpdateRouteCacheForIds(changed);
+  } else if (mode_ == RouteMode::kAsync && async_router_) {
+    const auto surviving =
+        async_router_->UpdateBlockPins(block_id, new_rect, std::move(new_pins));
+    UpdateRouteCacheForIds(surviving);
+  }
+  for (localroute::Id cid : removed_cids) {
+    RemoveRouteCacheEntry(cid);
+  }
+  route_time_ms_ = static_cast<double>(timer.nsecsElapsed()) / 1e6;
+  RecordRouteSample(route_time_ms_);
+  PushUndoCommand(std::move(cmd));
 
   highlighted_conns_.clear();
   for (localroute::Id cid : ActiveView().adjacent_conns(block_id)) {
     highlighted_conns_.insert(cid);
   }
-  update();
+  RefreshAfterIncrementalEdit();
 }
 
 localroute::Id CanvasWidget::AddWire(localroute::Id src_block,
@@ -775,55 +1107,167 @@ localroute::Id CanvasWidget::AddWire(localroute::Id src_block,
   highlighted_conns_.clear();
   highlighted_conns_.insert(new_cid);
 
-  ApplyModelEdit([conn, new_cid](localroute::LocalOrthogonalRouter* r) {
-    r->AddConnector(conn);
-    return std::vector<localroute::Id>{new_cid};
-  });
+  QElapsedTimer timer;
+  timer.start();
+  AddConnectorIncremental(conn);
+  route_time_ms_ = static_cast<double>(timer.nsecsElapsed()) / 1e6;
+  RecordRouteSample(route_time_ms_);
+
+  EditCommand cmd;
+  cmd.kind = EditCommand::Kind::kAddItems;
+  cmd.conns.push_back(conn);
+  if (const auto rit = ActiveView().all_routes().find(new_cid);
+      rit != ActiveView().all_routes().end()) {
+    cmd.after_routes.emplace_back(new_cid, rit->second);
+  }
+  PushUndoCommand(std::move(cmd));
+  RefreshAfterIncrementalEdit();
   return new_cid;
 }
 
 void CanvasWidget::DeleteSelection() {
+  const auto& view = ActiveView();
   if (has_selected_conn_) {
     const localroute::Id cid = selected_conn_id_;
     has_selected_conn_ = false;
     highlighted_conns_.erase(cid);
-    ApplyModelEdit([cid](localroute::LocalOrthogonalRouter* r) {
-      if (r->all_conns().count(cid)) {
-        r->RemoveConnector(cid);
-      }
-      return std::vector<localroute::Id>{};
-    });
+    const auto cit = view.all_conns().find(cid);
+    if (cit == view.all_conns().end()) {
+      return;
+    }
+    EditCommand cmd;
+    cmd.kind = EditCommand::Kind::kDeleteItems;
+    cmd.conns.push_back(cit->second);
+    if (const auto rit = view.all_routes().find(cid);
+        rit != view.all_routes().end()) {
+      cmd.before_routes.emplace_back(cid, rit->second);
+    }
+    QElapsedTimer timer;
+    timer.start();
+    RemoveConnectorIncremental(cid);
+    route_time_ms_ = static_cast<double>(timer.nsecsElapsed()) / 1e6;
+    RecordRouteSample(route_time_ms_);
+    PushUndoCommand(std::move(cmd));
+    RefreshAfterIncrementalEdit();
     return;
   }
   if (!selected_blocks_.empty()) {
     const std::vector<localroute::Id> to_del(selected_blocks_.begin(),
                                              selected_blocks_.end());
-    selected_blocks_.clear();
-    highlighted_conns_.clear();
-    ApplyModelEdit([&](localroute::LocalOrthogonalRouter* r) {
-      for (localroute::Id bid : to_del) {
-        if (r->all_blocks().count(bid)) {
-          r->RemoveBlock(bid);
+    EditCommand cmd;
+    cmd.kind = EditCommand::Kind::kDeleteItems;
+    std::unordered_set<localroute::Id> seen_conns;
+    for (localroute::Id bid : to_del) {
+      if (!view.all_blocks().count(bid)) {
+        continue;
+      }
+      cmd.blocks.push_back(view.block(bid));
+      for (localroute::Id cid : view.adjacent_conns(bid)) {
+        if (seen_conns.insert(cid).second && view.all_conns().count(cid)) {
+          cmd.conns.push_back(view.all_conns().at(cid));
+          if (const auto rit = view.all_routes().find(cid);
+              rit != view.all_routes().end()) {
+            cmd.before_routes.emplace_back(cid, rit->second);
+          }
         }
       }
-      return std::vector<localroute::Id>{};
-    });
+    }
+    selected_blocks_.clear();
+    highlighted_conns_.clear();
+
+    QElapsedTimer timer;
+    timer.start();
+    for (localroute::Id bid : to_del) {
+      RemoveBlockIncremental(bid);
+    }
+    route_time_ms_ = static_cast<double>(timer.nsecsElapsed()) / 1e6;
+    RecordRouteSample(route_time_ms_);
+    if (!cmd.blocks.empty()) {
+      PushUndoCommand(std::move(cmd));
+    }
+    RefreshAfterIncrementalEdit();
   }
 }
 
 void CanvasWidget::ClearBlockWires(localroute::Id block_id) {
-  if (!ActiveView().all_blocks().count(block_id)) {
+  const auto& view = ActiveView();
+  if (!view.all_blocks().count(block_id)) {
     return;
+  }
+  const std::vector<localroute::Id> conns = view.adjacent_conns(block_id);
+  if (conns.empty()) {
+    return;
+  }
+  EditCommand cmd;
+  cmd.kind = EditCommand::Kind::kDeleteItems;
+  for (localroute::Id cid : conns) {
+    if (view.all_conns().count(cid)) {
+      cmd.conns.push_back(view.all_conns().at(cid));
+      if (const auto rit = view.all_routes().find(cid);
+          rit != view.all_routes().end()) {
+        cmd.before_routes.emplace_back(cid, rit->second);
+      }
+    }
   }
   highlighted_conns_.clear();
   has_selected_conn_ = false;
-  ApplyModelEdit([block_id](localroute::LocalOrthogonalRouter* r) {
-    const auto conns = r->adjacent_conns(block_id);
-    for (localroute::Id cid : conns) {
-      r->RemoveConnector(cid);
-    }
-    return std::vector<localroute::Id>{};
-  });
+
+  QElapsedTimer timer;
+  timer.start();
+  for (localroute::Id cid : conns) {
+    RemoveConnectorIncremental(cid);
+  }
+  route_time_ms_ = static_cast<double>(timer.nsecsElapsed()) / 1e6;
+  RecordRouteSample(route_time_ms_);
+  PushUndoCommand(std::move(cmd));
+  RefreshAfterIncrementalEdit();
+}
+
+void CanvasWidget::AddRouteCacheEntry(localroute::Id conn_id) {
+  if (route_cache_index_.count(conn_id)) {
+    UpdateRouteCacheForIds({conn_id});
+    return;
+  }
+  const auto& view = ActiveView();
+  const auto cit = view.all_conns().find(conn_id);
+  if (cit == view.all_conns().end()) {
+    return;
+  }
+  const auto& c = cit->second;
+  const auto& blocks = view.all_blocks();
+  const auto& routes = view.all_routes();
+  CachedRoute entry;
+  entry.id = conn_id;
+  const auto rit = routes.find(conn_id);
+  if (rit == routes.end() ||
+      rit->second.status == localroute::Status::kPending ||
+      rit->second.points.empty()) {
+    entry.status = localroute::Status::kPending;
+    entry.bounds = localroute::Box(PinPos(blocks.at(c.src), c.sp),
+                                   PinPos(blocks.at(c.dst), c.dp));
+  } else {
+    entry.status = rit->second.status;
+    entry.bounds = PointsBounds(rit->second.points);
+  }
+  ++status_counts_[static_cast<std::size_t>(entry.status)];
+  route_cache_index_.emplace(conn_id, route_cache_.size());
+  route_cache_.push_back(entry);
+}
+
+void CanvasWidget::RemoveRouteCacheEntry(localroute::Id conn_id) {
+  const auto it = route_cache_index_.find(conn_id);
+  if (it == route_cache_index_.end()) {
+    return;
+  }
+  const std::size_t idx = it->second;
+  --status_counts_[static_cast<std::size_t>(route_cache_[idx].status)];
+  const std::size_t last = route_cache_.size() - 1;
+  if (idx != last) {
+    route_cache_[idx] = route_cache_[last];
+    route_cache_index_[route_cache_[idx].id] = idx;
+  }
+  route_cache_.pop_back();
+  route_cache_index_.erase(it);
 }
 
 void CanvasWidget::RebuildRouteCache() {
@@ -1119,32 +1563,27 @@ void CanvasWidget::StepSmokeDrag(const std::vector<localroute::Id>& ids,
     return;
   }
   const auto& view = ActiveView();
+  std::vector<std::pair<localroute::Id, localroute::Rect>> before;
   std::vector<std::pair<localroute::Id, localroute::Rect>> moves;
+  before.reserve(ids.size());
   moves.reserve(ids.size());
   for (localroute::Id id : ids) {
     const localroute::Rect r = view.block(id).rect;
+    before.emplace_back(id, r);
     moves.push_back({id, {r.l + dx, r.t + dy, r.r + dx, r.b + dy}});
   }
   QElapsedTimer timer;
   timer.start();
-  if (mode_ == RouteMode::kSync && sync_router_) {
-    sync_router_->MoveBlocksBatch(moves);
-    const auto changed = sync_router_->RerouteAffected(ids);
-    route_time_ms_ = static_cast<double>(timer.nsecsElapsed()) / 1e6;
-    UpdateRouteCacheForIds(changed);
-  } else if (mode_ == RouteMode::kAsync && async_router_) {
-    async_router_->Move(moves);
-    std::vector<localroute::Id> updated;
-    async_router_->Poll(128, &updated);
-    route_time_ms_ = static_cast<double>(timer.nsecsElapsed()) / 1e6;
-    for (localroute::Id id : ids) {
-      UpdateRouteBoundsFromBlock(id);
-    }
-    if (!updated.empty()) {
-      UpdateRouteCacheForIds(updated);
-    }
-  }
+  ApplyBlockMovesDelta(moves);
+  route_time_ms_ = static_cast<double>(timer.nsecsElapsed()) / 1e6;
   RecordRouteSample(route_time_ms_);
+
+  EditCommand cmd;
+  cmd.kind = EditCommand::Kind::kMoveBlocks;
+  cmd.before_rects = std::move(before);
+  cmd.after_rects = std::move(moves);
+  PushUndoCommand(std::move(cmd));
+  emit StatusChanged();
 }
 
 bool CanvasWidget::StepSmokeSegmentDrag(localroute::Id conn_id,
@@ -1153,15 +1592,19 @@ bool CanvasWidget::StepSmokeSegmentDrag(localroute::Id conn_id,
   QElapsedTimer timer;
   timer.start();
   bool ok = false;
+  std::vector<localroute::Id> changed;
   if (mode_ == RouteMode::kSync && sync_router_) {
-    ok = sync_router_->MoveRouteSegment(conn_id, seg_index, new_coord);
+    ok =
+        sync_router_->MoveRouteSegment(conn_id, seg_index, new_coord, &changed);
   } else if (mode_ == RouteMode::kAsync && async_router_) {
-    ok = async_router_->MoveRouteSegment(conn_id, seg_index, new_coord);
+    ok = async_router_->MoveRouteSegment(conn_id, seg_index, new_coord,
+                                         &changed);
   }
   route_time_ms_ = static_cast<double>(timer.nsecsElapsed()) / 1e6;
   RecordRouteSample(route_time_ms_);
   if (ok) {
-    UpdateRouteCacheForIds({conn_id});
+    UpdateRouteCacheForIds(
+        changed.empty() ? std::vector<localroute::Id>{conn_id} : changed);
     update();
     emit StatusChanged();
   }
@@ -1184,6 +1627,28 @@ std::vector<localroute::Id> CanvasWidget::StepSmokeAutoRoute(
   update();
   emit StatusChanged();
   return changed;
+}
+
+double CanvasWidget::StepSmokeUndo(bool* ok_out) {
+  QElapsedTimer timer;
+  timer.start();
+  const bool ok = Undo();
+  const double ms = static_cast<double>(timer.nsecsElapsed()) / 1e6;
+  if (ok_out) {
+    *ok_out = ok;
+  }
+  return ms;
+}
+
+double CanvasWidget::StepSmokeRedo(bool* ok_out) {
+  QElapsedTimer timer;
+  timer.start();
+  const bool ok = Redo();
+  const double ms = static_cast<double>(timer.nsecsElapsed()) / 1e6;
+  if (ok_out) {
+    *ok_out = ok;
+  }
+  return ms;
 }
 
 void CanvasWidget::OnAsyncTick() {
@@ -1254,27 +1719,40 @@ void CanvasWidget::mousePressEvent(QMouseEvent* event) {
     return;
   }
 
-  // 2. Check block hit for selection / drag.
+  // 2. Check block hit for selection / drag (or Ctrl+Drag duplicate).
   const QPointF world_pos = ScreenToWorld(event->pos());
   const localroute::Id hit = HitTestBlock(world_pos);
   const auto& view = ActiveView();
 
   if (hit != std::numeric_limits<localroute::Id>::max()) {
     has_selected_conn_ = false;
+    active_guides_.clear();
+    drag_initial_rects_.clear();
     if (event->modifiers() & Qt::ControlModifier) {
-      if (selected_blocks_.count(hit)) {
-        selected_blocks_.erase(hit);
+      ctrl_dup_armed_ = true;
+      ctrl_click_block_ = hit;
+      ctrl_press_screen_ = event->pos();
+      ctrl_click_was_selected_ = selected_blocks_.count(hit) != 0;
+      has_pending_dup_cmd_ = false;
+      drag_kind_ = DragKind::kMoveBlocks;
+      drag_start_world_ = world_pos;
+      if (ctrl_click_was_selected_) {
+        for (localroute::Id id : selected_blocks_) {
+          drag_initial_rects_.emplace(id, view.block(id).rect);
+        }
       } else {
-        selected_blocks_.insert(hit);
+        drag_initial_rects_.emplace(hit, view.block(hit).rect);
       }
-    } else if (!selected_blocks_.count(hit)) {
+      return;
+    }
+    ctrl_dup_armed_ = false;
+    has_pending_dup_cmd_ = false;
+    if (!selected_blocks_.count(hit)) {
       selected_blocks_.clear();
       selected_blocks_.insert(hit);
     }
     drag_kind_ = DragKind::kMoveBlocks;
     drag_start_world_ = world_pos;
-    drag_initial_rects_.clear();
-    active_guides_.clear();
     highlighted_conns_.clear();
     for (localroute::Id id : selected_blocks_) {
       drag_initial_rects_.emplace(id, view.block(id).rect);
@@ -1288,13 +1766,53 @@ void CanvasWidget::mousePressEvent(QMouseEvent* event) {
     return;
   }
 
-  // 3. Check wire segment hit for dragging middle segments, or wire hit for
-  //    selection.
+  // 3. Check wire segment hit: Ctrl+Drag branches a new fan-out wire from the
+  //    existing signal; plain Drag moves the orthogonal segment (and any
+  //    collinear same-net shared trunk).
   localroute::Id seg_cid = 0;
   std::size_t seg_idx = 0;
   bool seg_vert = false;
-  if (!(event->modifiers() & Qt::ControlModifier) &&
-      HitTestWireSegment(event->pos(), &seg_cid, &seg_idx, &seg_vert)) {
+  if (HitTestWireSegment(event->pos(), &seg_cid, &seg_idx, &seg_vert)) {
+    const auto cit = view.all_conns().find(seg_cid);
+    const auto rit = view.all_routes().find(seg_cid);
+    if ((event->modifiers() & Qt::ControlModifier) &&
+        cit != view.all_conns().end() && rit != view.all_routes().end() &&
+        seg_idx + 1 < rit->second.points.size()) {
+      const localroute::Conn& base = cit->second;
+      const auto& p0 = rit->second.points[seg_idx];
+      const auto& p1 = rit->second.points[seg_idx + 1];
+      localroute::Point branch_pt;
+      if (seg_vert) {
+        branch_pt = {p0.x, std::clamp(world_pos.y(), std::min(p0.y, p1.y),
+                                      std::max(p0.y, p1.y))};
+      } else {
+        branch_pt = {std::clamp(world_pos.x(), std::min(p0.x, p1.x),
+                                std::max(p0.x, p1.x)),
+                     p0.y};
+      }
+      drag_kind_ = DragKind::kWiring;
+      wire_src_ = {true, base.src, base.sp, branch_pt};
+      drag_start_world_ = QPointF(branch_pt.x, branch_pt.y);
+      drag_current_world_ = drag_start_world_;
+      hover_pin_ = PinHit{};
+      setCursor(Qt::CrossCursor);
+      update();
+      return;
+    }
+
+    seg_drag_before_routes_.clear();
+    if (cit != view.all_conns().end()) {
+      const localroute::Conn& base = cit->second;
+      for (localroute::Id sib_cid : view.adjacent_conns(base.src)) {
+        const auto scit = view.all_conns().find(sib_cid);
+        const auto srit = view.all_routes().find(sib_cid);
+        if (scit != view.all_conns().end() && srit != view.all_routes().end() &&
+            scit->second.src == base.src && scit->second.sp == base.sp) {
+          seg_drag_before_routes_.emplace_back(sib_cid, srit->second);
+        }
+      }
+    }
+
     selected_blocks_.clear();
     highlighted_conns_.clear();
     highlighted_conns_.insert(seg_cid);
@@ -1369,18 +1887,67 @@ void CanvasWidget::mouseMoveEvent(QMouseEvent* event) {
   }
 
   if (drag_kind_ == DragKind::kMoveSegment) {
+    active_guides_.clear();
     const QPointF world_pos = ScreenToWorld(pos);
-    const double new_coord =
-        drag_seg_is_vertical_ ? world_pos.x() : world_pos.y();
+    double new_coord = drag_seg_is_vertical_ ? world_pos.x() : world_pos.y();
+
+    // Smart Snap during segment drag (align straight with endpoint pins unless
+    // Alt is held).
+    if (!(event->modifiers() & Qt::AltModifier)) {
+      const auto& view = ActiveView();
+      const auto cit = view.all_conns().find(drag_seg_conn_id_);
+      if (cit != view.all_conns().end()) {
+        const localroute::Conn& c = cit->second;
+        const localroute::Point a = PinPos(view.block(c.src), c.sp);
+        const localroute::Point b = PinPos(view.block(c.dst), c.dp);
+        constexpr double kSegSnapTol = 5.0;
+        double best_err = kSegSnapTol + 1e-6;
+        double snapped = new_coord;
+        bool did_snap = false;
+        for (const localroute::Point& pt : {a, b}) {
+          const double ref = drag_seg_is_vertical_ ? pt.x : pt.y;
+          const double err = std::abs(new_coord - ref);
+          if (err <= kSegSnapTol && err < best_err) {
+            best_err = err;
+            snapped = ref;
+            did_snap = true;
+          }
+        }
+        if (did_snap) {
+          new_coord = snapped;
+          double s0 =
+              drag_seg_is_vertical_ ? std::min(a.y, b.y) : std::min(a.x, b.x);
+          double s1 =
+              drag_seg_is_vertical_ ? std::max(a.y, b.y) : std::max(a.x, b.x);
+          const auto rit = view.all_routes().find(drag_seg_conn_id_);
+          if (rit != view.all_routes().end() &&
+              drag_seg_index_ + 1 < rit->second.points.size()) {
+            const auto& p0 = rit->second.points[drag_seg_index_];
+            const auto& p1 = rit->second.points[drag_seg_index_ + 1];
+            if (drag_seg_is_vertical_) {
+              s0 = std::min({s0, p0.y, p1.y});
+              s1 = std::max({s1, p0.y, p1.y});
+            } else {
+              s0 = std::min({s0, p0.x, p1.x});
+              s1 = std::max({s1, p0.x, p1.x});
+            }
+          }
+          active_guides_.push_back(
+              {drag_seg_is_vertical_, new_coord, s0 - 24.0, s1 + 24.0});
+        }
+      }
+    }
+
     QElapsedTimer timer;
     timer.start();
     bool ok = false;
+    std::vector<localroute::Id> changed;
     if (mode_ == RouteMode::kSync && sync_router_) {
       ok = sync_router_->MoveRouteSegment(drag_seg_conn_id_, drag_seg_index_,
-                                          new_coord);
+                                          new_coord, &changed);
     } else if (mode_ == RouteMode::kAsync && async_router_) {
       ok = async_router_->MoveRouteSegment(drag_seg_conn_id_, drag_seg_index_,
-                                           new_coord);
+                                           new_coord, &changed);
     }
     route_time_ms_ = static_cast<double>(timer.nsecsElapsed()) / 1e6;
     RecordRouteSample(route_time_ms_);
@@ -1415,7 +1982,9 @@ void CanvasWidget::mouseMoveEvent(QMouseEvent* event) {
           drag_seg_index_ = best_j;
         }
       }
-      UpdateRouteCacheForIds({drag_seg_conn_id_});
+      UpdateRouteCacheForIds(
+          changed.empty() ? std::vector<localroute::Id>{drag_seg_conn_id_}
+                          : changed);
       update();
       emit StatusChanged();
     }
@@ -1423,6 +1992,55 @@ void CanvasWidget::mouseMoveEvent(QMouseEvent* event) {
   }
 
   if (drag_kind_ == DragKind::kMoveBlocks && !drag_initial_rects_.empty()) {
+    if (ctrl_dup_armed_) {
+      const QPointF delta_px = pos - ctrl_press_screen_;
+      if (delta_px.x() * delta_px.x() + delta_px.y() * delta_px.y() < 25.0) {
+        return;
+      }
+      ctrl_dup_armed_ = false;
+      const auto& view = ActiveView();
+      std::unordered_map<localroute::Id, localroute::Id> old_to_new;
+      std::unordered_map<localroute::Id, localroute::Rect> new_initial;
+      EditCommand dup_cmd;
+      dup_cmd.kind = EditCommand::Kind::kAddItems;
+
+      selected_blocks_.clear();
+      highlighted_conns_.clear();
+      for (const auto& kv : drag_initial_rects_) {
+        if (!view.all_blocks().count(kv.first)) {
+          continue;
+        }
+        localroute::Block copy = view.block(kv.first);
+        copy.id = next_block_id_++;
+        old_to_new.emplace(kv.first, copy.id);
+        new_initial.emplace(copy.id, copy.rect);
+        selected_blocks_.insert(copy.id);
+        dup_cmd.blocks.push_back(copy);
+        AddBlockIncremental(std::move(copy));
+      }
+      for (const auto& kv : view.all_conns()) {
+        const localroute::Conn& c = kv.second;
+        const auto sit = old_to_new.find(c.src);
+        const auto dit = old_to_new.find(c.dst);
+        if (sit != old_to_new.end() && dit != old_to_new.end()) {
+          const localroute::Id new_cid = next_conn_id_++;
+          const localroute::Conn new_conn{new_cid, sit->second, c.sp,
+                                          dit->second, c.dp};
+          dup_cmd.conns.push_back(new_conn);
+          highlighted_conns_.insert(new_cid);
+          AddConnectorIncremental(new_conn);
+        }
+      }
+      drag_initial_rects_ = std::move(new_initial);
+      pending_dup_cmd_ = std::move(dup_cmd);
+      has_pending_dup_cmd_ = true;
+      current_block_count_ =
+          static_cast<unsigned>(ActiveView().all_blocks().size());
+      current_conn_count_ =
+          static_cast<unsigned>(ActiveView().all_conns().size());
+      emit SelectionChanged();
+    }
+
     const QPointF world_pos = ScreenToWorld(pos);
     double dx = world_pos.x() - drag_start_world_.x();
     double dy = world_pos.y() - drag_start_world_.y();
@@ -1611,7 +2229,11 @@ void CanvasWidget::mouseMoveEvent(QMouseEvent* event) {
       std::size_t seg_idx = 0;
       bool seg_vert = false;
       if (HitTestWireSegment(pos, &seg_cid, &seg_idx, &seg_vert)) {
-        setCursor(seg_vert ? Qt::SizeHorCursor : Qt::SizeVerCursor);
+        if (event->modifiers() & Qt::ControlModifier) {
+          setCursor(Qt::CrossCursor);
+        } else {
+          setCursor(seg_vert ? Qt::SizeHorCursor : Qt::SizeVerCursor);
+        }
       } else {
         setCursor(Qt::ArrowCursor);
       }
@@ -1675,7 +2297,27 @@ void CanvasWidget::mouseReleaseEvent(QMouseEvent* event) {
 
   if (drag_kind_ == DragKind::kMoveSegment) {
     drag_kind_ = DragKind::kNone;
+    active_guides_.clear();
     setCursor(Qt::ArrowCursor);
+
+    EditCommand cmd;
+    cmd.kind = EditCommand::Kind::kModifyRoutes;
+    const auto& all_routes = ActiveView().all_routes();
+    for (const auto& kv : seg_drag_before_routes_) {
+      const auto rit = all_routes.find(kv.first);
+      if (rit != all_routes.end() &&
+          (!(rit->second.points == kv.second.points) ||
+           rit->second.status != kv.second.status ||
+           rit->second.user_modified != kv.second.user_modified)) {
+        cmd.before_routes.push_back(kv);
+        cmd.after_routes.emplace_back(kv.first, rit->second);
+      }
+    }
+    seg_drag_before_routes_.clear();
+    if (!cmd.after_routes.empty()) {
+      PushUndoCommand(std::move(cmd));
+    }
+
     update();
     emit StatusChanged();
     return;
@@ -1684,6 +2326,27 @@ void CanvasWidget::mouseReleaseEvent(QMouseEvent* event) {
   if (drag_kind_ == DragKind::kMoveBlocks) {
     drag_kind_ = DragKind::kNone;
     active_guides_.clear();
+    if (ctrl_dup_armed_) {
+      ctrl_dup_armed_ = false;
+      drag_initial_rects_.clear();
+      if (ctrl_click_was_selected_) {
+        selected_blocks_.erase(ctrl_click_block_);
+      } else {
+        selected_blocks_.insert(ctrl_click_block_);
+      }
+      highlighted_conns_.clear();
+      const auto& view = ActiveView();
+      for (localroute::Id id : selected_blocks_) {
+        for (localroute::Id cid : view.adjacent_conns(id)) {
+          highlighted_conns_.insert(cid);
+        }
+      }
+      UpdateViewportPriority();
+      update();
+      emit SelectionChanged();
+      return;
+    }
+
     if (mode_ == RouteMode::kSync && sync_router_) {
       std::vector<localroute::Id> moved_ids;
       for (const auto& kv : drag_initial_rects_) {
@@ -1701,13 +2364,65 @@ void CanvasWidget::mouseReleaseEvent(QMouseEvent* event) {
         async_timer_.start();
       }
     }
+
+    const auto& view = ActiveView();
+    if (has_pending_dup_cmd_) {
+      has_pending_dup_cmd_ = false;
+      for (auto& blk : pending_dup_cmd_.blocks) {
+        if (view.all_blocks().count(blk.id)) {
+          blk.rect = view.block(blk.id).rect;
+        }
+      }
+      for (const auto& c : pending_dup_cmd_.conns) {
+        if (const auto rit = view.all_routes().find(c.id);
+            rit != view.all_routes().end()) {
+          pending_dup_cmd_.after_routes.emplace_back(c.id, rit->second);
+        }
+      }
+      PushUndoCommand(std::move(pending_dup_cmd_));
+    } else {
+      EditCommand move_cmd;
+      move_cmd.kind = EditCommand::Kind::kMoveBlocks;
+      bool any_moved = false;
+      for (const auto& kv : drag_initial_rects_) {
+        if (!view.all_blocks().count(kv.first)) {
+          continue;
+        }
+        const localroute::Rect after_r = view.block(kv.first).rect;
+        if (std::abs(after_r.l - kv.second.l) > 1e-6 ||
+            std::abs(after_r.t - kv.second.t) > 1e-6 ||
+            std::abs(after_r.r - kv.second.r) > 1e-6 ||
+            std::abs(after_r.b - kv.second.b) > 1e-6) {
+          any_moved = true;
+        }
+        move_cmd.before_rects.push_back(kv);
+        move_cmd.after_rects.emplace_back(kv.first, after_r);
+      }
+      if (any_moved) {
+        PushUndoCommand(std::move(move_cmd));
+      }
+    }
+
     drag_initial_rects_.clear();
+    RefreshWorldBounds();
     update();
     emit StatusChanged();
   }
 }
 
 void CanvasWidget::keyPressEvent(QKeyEvent* event) {
+  if ((event->modifiers() & Qt::ControlModifier) && event->key() == Qt::Key_Z) {
+    if (event->modifiers() & Qt::ShiftModifier) {
+      (void)Redo();
+    } else {
+      (void)Undo();
+    }
+    return;
+  }
+  if ((event->modifiers() & Qt::ControlModifier) && event->key() == Qt::Key_Y) {
+    (void)Redo();
+    return;
+  }
   if (event->key() == Qt::Key_Space && !event->isAutoRepeat()) {
     space_pressed_ = true;
     if (drag_kind_ == DragKind::kNone) {
@@ -1898,6 +2613,8 @@ void CanvasWidget::paintEvent(QPaintEvent* /*event*/) {
   QPen display_pen =
       highlight_fallback_ ? QPen(QColor(230, 126, 34), 1.5) : valid_pen;
   display_pen.setCosmetic(true);
+  QPen warn_pen(QColor(220, 38, 38), 1.8, Qt::DashLine);
+  warn_pen.setCosmetic(true);
   QPen hi_valid_pen(QColor(0, 120, 215), 2.2);
   hi_valid_pen.setCosmetic(true);
   QPen hi_pending_pen(QColor(0, 120, 215), 1.8, Qt::DashLine);
@@ -1905,9 +2622,12 @@ void CanvasWidget::paintEvent(QPaintEvent* /*event*/) {
   QPen hi_display_pen =
       highlight_fallback_ ? QPen(QColor(230, 126, 34), 2.2) : hi_valid_pen;
   hi_display_pen.setCosmetic(true);
+  QPen hi_warn_pen(QColor(220, 38, 38), 2.4, Qt::DashLine);
+  hi_warn_pen.setCosmetic(true);
 
   const bool draw_solder = zoom_ >= 0.25;
   const bool draw_hops = zoom_ >= 0.4 && show_line_hops_;
+  const bool draw_arrows = zoom_ >= 0.45;
 
   struct VisHSeg {
     double x0 = 0.0;
@@ -1915,7 +2635,8 @@ void CanvasWidget::paintEvent(QPaintEvent* /*event*/) {
     double y = 0.0;
     localroute::Id src = 0;
     localroute::Id sp = 0;
-    int bucket = 0;  // 0: valid, 1: display, 2: hi_valid, 3: hi_display
+    int bucket = 0;  // 0: valid, 1: display, 2: hi_valid, 3: hi_display,
+                     // 4: warn, 5: hi_warn
   };
   struct VisVSeg {
     double x = 0.0;
@@ -1924,13 +2645,22 @@ void CanvasWidget::paintEvent(QPaintEvent* /*event*/) {
     localroute::Id src = 0;
     localroute::Id sp = 0;
   };
+  struct ArrowHead {
+    double x = 0.0;
+    double y = 0.0;
+    double dx = 0.0;
+    double dy = 0.0;
+    int bucket = 0;
+  };
 
   QVector<QLineF> valid_segs;
   QVector<QLineF> pending_segs;
   QVector<QLineF> display_segs;
+  QVector<QLineF> warn_segs;
   QVector<QLineF> hi_valid_segs;
   QVector<QLineF> hi_pending_segs;
   QVector<QLineF> hi_display_segs;
+  QVector<QLineF> hi_warn_segs;
   valid_segs.reserve(2048);
   pending_segs.reserve(1024);
   display_segs.reserve(128);
@@ -1940,13 +2670,38 @@ void CanvasWidget::paintEvent(QPaintEvent* /*event*/) {
   }
   std::vector<VisHSeg> vis_h;
   std::vector<VisVSeg> vis_v;
-  std::array<std::vector<QRectF>, 4> hop_arcs;
+  std::array<std::vector<QRectF>, 6> hop_arcs;
   if (draw_hops) {
     vis_h.reserve(1024);
     vis_v.reserve(1024);
   }
+  std::vector<ArrowHead> arrows;
+  if (draw_arrows) {
+    arrows.reserve(512);
+  }
   std::vector<localroute::Id> top_highlight;
   top_highlight.reserve(highlighted_conns_.size());
+
+  auto record_arrow = [&](int bucket,
+                          const std::vector<localroute::Point>& pts) {
+    if (!draw_arrows || pts.size() < 2) {
+      return;
+    }
+    const localroute::Point tip = pts.back();
+    if (tip.x < vp.l - 12.0 || tip.x > vp.r + 12.0 || tip.y < vp.t - 12.0 ||
+        tip.y > vp.b + 12.0) {
+      return;
+    }
+    for (std::size_t k = pts.size() - 1; k > 0; --k) {
+      const double dx = tip.x - pts[k - 1].x;
+      const double dy = tip.y - pts[k - 1].y;
+      const double len = std::hypot(dx, dy);
+      if (len > 1e-6) {
+        arrows.push_back({tip.x, tip.y, dx / len, dy / len, bucket});
+        return;
+      }
+    }
+  };
 
   auto append_clipped = [&](QVector<QLineF>* dst, localroute::Point p0,
                             localroute::Point p1) {
@@ -1973,23 +2728,26 @@ void CanvasWidget::paintEvent(QPaintEvent* /*event*/) {
     }
   };
 
-  auto append_hop_candidate = [&](int bucket, const localroute::Conn& conn,
-                                  localroute::Point p0, localroute::Point p1) {
-    QVector<QLineF>* dst = nullptr;
+  auto bucket_lines = [&](int bucket) -> QVector<QLineF>* {
     switch (bucket) {
       case 0:
-        dst = &valid_segs;
-        break;
+        return &valid_segs;
       case 1:
-        dst = &display_segs;
-        break;
+        return &display_segs;
       case 2:
-        dst = &hi_valid_segs;
-        break;
+        return &hi_valid_segs;
+      case 3:
+        return &hi_display_segs;
+      case 4:
+        return &warn_segs;
       default:
-        dst = &hi_display_segs;
-        break;
+        return &hi_warn_segs;
     }
+  };
+
+  auto append_hop_candidate = [&](int bucket, const localroute::Conn& conn,
+                                  localroute::Point p0, localroute::Point p1) {
+    QVector<QLineF>* dst = bucket_lines(bucket);
     if (p0.x == p1.x) {
       if (p0.x < vp.l || p0.x > vp.r) {
         return;
@@ -2049,17 +2807,23 @@ void CanvasWidget::paintEvent(QPaintEvent* /*event*/) {
         continue;
       }
       const auto& pts = rit->second.points;
+      const int bucket =
+          (rit->second.status == localroute::Status::kValid)
+              ? 0
+              : ((rit->second.user_modified &&
+                  rit->second.status == localroute::Status::kDisplayOnly)
+                     ? 4
+                     : 1);
+      record_arrow(bucket, pts);
       if (draw_hops) {
-        const int bucket = (entry.status == localroute::Status::kValid) ? 0 : 1;
         const auto& c = all_conns.at(entry.id);
         for (std::size_t j = 1; j < pts.size(); ++j) {
           append_hop_candidate(bucket, c, pts[j - 1], pts[j]);
         }
       } else {
-        auto& dst = (entry.status == localroute::Status::kValid) ? valid_segs
-                                                                 : display_segs;
+        QVector<QLineF>* dst = bucket_lines(bucket);
         for (std::size_t j = 1; j < pts.size(); ++j) {
-          append_clipped(&dst, pts[j - 1], pts[j]);
+          append_clipped(dst, pts[j - 1], pts[j]);
         }
       }
     }
@@ -2083,19 +2847,23 @@ void CanvasWidget::paintEvent(QPaintEvent* /*event*/) {
       }
     } else {
       const auto& pts = rit->second.points;
+      const int bucket =
+          (rit->second.status == localroute::Status::kValid)
+              ? 2
+              : ((rit->second.user_modified &&
+                  rit->second.status == localroute::Status::kDisplayOnly)
+                     ? 5
+                     : 3);
+      record_arrow(bucket, pts);
       if (draw_hops) {
-        const int bucket =
-            (rit->second.status == localroute::Status::kValid) ? 2 : 3;
         const auto& c = all_conns.at(cid);
         for (std::size_t j = 1; j < pts.size(); ++j) {
           append_hop_candidate(bucket, c, pts[j - 1], pts[j]);
         }
       } else {
-        auto& dst = (rit->second.status == localroute::Status::kValid)
-                        ? hi_valid_segs
-                        : hi_display_segs;
+        QVector<QLineF>* dst = bucket_lines(bucket);
         for (std::size_t j = 1; j < pts.size(); ++j) {
-          append_clipped(&dst, pts[j - 1], pts[j]);
+          append_clipped(dst, pts[j - 1], pts[j]);
         }
       }
     }
@@ -2107,21 +2875,7 @@ void CanvasWidget::paintEvent(QPaintEvent* /*event*/) {
               [](const VisVSeg& a, const VisVSeg& b) { return a.x < b.x; });
     std::vector<double> crossings;
     for (const VisHSeg& h : vis_h) {
-      QVector<QLineF>* dst = nullptr;
-      switch (h.bucket) {
-        case 0:
-          dst = &valid_segs;
-          break;
-        case 1:
-          dst = &display_segs;
-          break;
-        case 2:
-          dst = &hi_valid_segs;
-          break;
-        default:
-          dst = &hi_display_segs;
-          break;
-      }
+      QVector<QLineF>* dst = bucket_lines(h.bucket);
       if (h.x1 - h.x0 <= 2.0 * hop_r || vis_v.empty()) {
         dst->append(QLineF(h.x0, h.y, h.x1, h.y));
         continue;
@@ -2199,7 +2953,12 @@ void CanvasWidget::paintEvent(QPaintEvent* /*event*/) {
     painter.setPen(display_pen);
     painter.drawLines(display_segs);
   }
-  if (draw_hops && (!hop_arcs[0].empty() || !hop_arcs[1].empty())) {
+  if (!warn_segs.isEmpty()) {
+    painter.setPen(warn_pen);
+    painter.drawLines(warn_segs);
+  }
+  if (draw_hops &&
+      (!hop_arcs[0].empty() || !hop_arcs[1].empty() || !hop_arcs[4].empty())) {
     painter.setRenderHint(QPainter::Antialiasing, true);
     if (!hop_arcs[0].empty()) {
       painter.setPen(valid_pen);
@@ -2210,6 +2969,12 @@ void CanvasWidget::paintEvent(QPaintEvent* /*event*/) {
     if (!hop_arcs[1].empty()) {
       painter.setPen(display_pen);
       for (const QRectF& arc_rect : hop_arcs[1]) {
+        painter.drawArc(arc_rect, 0, 180 * 16);
+      }
+    }
+    if (!hop_arcs[4].empty()) {
+      painter.setPen(warn_pen);
+      for (const QRectF& arc_rect : hop_arcs[4]) {
         painter.drawArc(arc_rect, 0, 180 * 16);
       }
     }
@@ -2319,7 +3084,12 @@ void CanvasWidget::paintEvent(QPaintEvent* /*event*/) {
     painter.setPen(hi_display_pen);
     painter.drawLines(hi_display_segs);
   }
-  if (draw_hops && (!hop_arcs[2].empty() || !hop_arcs[3].empty())) {
+  if (!hi_warn_segs.isEmpty()) {
+    painter.setPen(hi_warn_pen);
+    painter.drawLines(hi_warn_segs);
+  }
+  if (draw_hops &&
+      (!hop_arcs[2].empty() || !hop_arcs[3].empty() || !hop_arcs[5].empty())) {
     painter.setRenderHint(QPainter::Antialiasing, true);
     if (!hop_arcs[2].empty()) {
       painter.setPen(hi_valid_pen);
@@ -2332,6 +3102,47 @@ void CanvasWidget::paintEvent(QPaintEvent* /*event*/) {
       for (const QRectF& arc_rect : hop_arcs[3]) {
         painter.drawArc(arc_rect, 0, 180 * 16);
       }
+    }
+    if (!hop_arcs[5].empty()) {
+      painter.setPen(hi_warn_pen);
+      for (const QRectF& arc_rect : hop_arcs[5]) {
+        painter.drawArc(arc_rect, 0, 180 * 16);
+      }
+    }
+  }
+  if (draw_arrows && !arrows.empty()) {
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setPen(Qt::NoPen);
+    const double a_len = 7.5 / std::clamp(zoom_, 0.5, 1.5);
+    const double a_half_w = 3.2 / std::clamp(zoom_, 0.5, 1.5);
+    for (const ArrowHead& ah : arrows) {
+      switch (ah.bucket) {
+        case 0:
+          painter.setBrush(QColor(30, 78, 140));
+          break;
+        case 1:
+          painter.setBrush(highlight_fallback_ ? QColor(230, 126, 34)
+                                               : QColor(30, 78, 140));
+          break;
+        case 2:
+          painter.setBrush(QColor(0, 120, 215));
+          break;
+        case 3:
+          painter.setBrush(highlight_fallback_ ? QColor(230, 126, 34)
+                                               : QColor(0, 120, 215));
+          break;
+        default:
+          painter.setBrush(QColor(220, 38, 38));
+          break;
+      }
+      const double bx = ah.x - ah.dx * a_len;
+      const double by = ah.y - ah.dy * a_len;
+      const double px = -ah.dy * a_half_w;
+      const double py = ah.dx * a_half_w;
+      QPolygonF tri;
+      tri << QPointF(ah.x, ah.y) << QPointF(bx + px, by + py)
+          << QPointF(bx - px, by - py);
+      painter.drawPolygon(tri);
     }
   }
   if (draw_solder && !visible_conn_ids.empty()) {

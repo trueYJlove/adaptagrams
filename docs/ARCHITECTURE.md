@@ -107,19 +107,21 @@ qt_demo/
 ### 3.5 异步会话模型（`AsyncLocalRouter`）
 
 * **双副本状态隔离**：主线程（Owner）仅操作 `model_`，后台工作线程独享一份独立的 `LocalOrthogonalRouter` 副本，彻底避免读写锁竞争或工作线程触碰 UI 数据。
-* **拖动合并与代际丢弃**：高频拖动调用 `Move()` 时，同模块多次位移直接合并覆盖到 `edits_` 表并递增 `generation_`；后台计算完毕提交结果时，若结果所属代际已落后于当前最新位置，自动丢弃过期路径。
-* **视口与选区优先**：调用 `Prioritize(viewport, selection)` 后，后台队列优先处理当前选中块和可见区域内的连线；单波次 `pending_` 清空时在 Owner 侧收口触发局部/全图 `ChannelNudger`。
-* **手动调线与显式整理透传**：`MoveRouteSegment()` 与 `AutoRouteConnectors()` 立即同步更新 Owner `model_`，并通过 `route_overrides_` 与递增 `generation_` 通知后台 `snapshot` 同步状态并丢弃过期在途结果。
+* **严格 FIFO 增量拓扑与拖动合并（`pending_ops_`）**：高频拖动调用 `Move()` 时，同模块位移合并覆盖到 `edits_`；当调用 `AddBlock`、`RemoveBlock`、`AddConnector`、`RemoveConnector`、`UpdateBlockPins`、`RestoreRoute`、`MoveRouteSegment` 或 `AutoRouteConnectors` 时，先经 `FlushCoalescedEditsLocked()` 将此前合并的 `edits_` 刷入有序队列 `pending_ops_` 末尾，再入队本次操作并递增 `generation_` 丢弃过期后台结果，确保双副本重放严格保序、零悬空 ID 竞态。
+* **视口优先与首屏分轨**：调用 `Prioritize(viewport, selection)` 后，后台队列优先处理选中块与可见区域内的连线；当当前视口 `priority_` 连线全部计算并出队后，不打断后台全图波次即在 Owner 侧先行触发一次局部 `ApplyChannelNudging()`，全图波次清空时再做最终收口。
 
-### 3.6 局部焊点检测与手动调线（`ComputeSolderJoints` / `MoveRouteSegment` / `AutoRouteConnectors`）
+### 3.6 局部焊点检测、无损端口更新与手动调线
 
 1. **按视口局部计算同源分叉焊点（`ComputeSolderJoints(conn_ids)`）**：
    * 纯只读局部查询接口（仅扫描调用方传入的当前视口可见连线子集，绝不扫描全图）：先过滤 `Status::kValid` 且点数 `>= 2` 的连线，按 `(src, sp)` 排序归组，对单线组直接零分配跳过。
    * 对多线同源组提取水平/垂直线段，检出三类电气分叉点（排除引脚起终点本身）：**T 型分叉点**（一方内顶点严格落在另一方线段内部）、**共享段分叉端点**（共线重叠区间端点处两条线朝不同方向离开）、**同源十字交点**（同源水平段与垂直段严格内部相交）；结果按 `1e-3` 容差去重。不同源（不同 `(src, sp)`）交叉绝不产生焊点。
-2. **手动拖拽连线线段（`MoveRouteSegment(conn_id, seg_index, new_coord)`）**：
-   * 拖动中间段（`1 <= seg_index <= pts.size() - 3`）时仅平移该段端点坐标，绝不改动首尾引脚；若拖动 2 点直连或首/末段，自动插入正交折弯使其包含中间段并保持引脚合法出线方向，清理退化共线点后置位 `user_modified = true` 与 `RouteMethod::kReuse`（碰撞障碍时按实际几何置为 `Status::kDisplayOnly`，绝不强行弹回破坏用户意图）。
-3. **显式整理连线（`AutoRouteConnectors(conn_ids)`）**：
-   * 清除指定连线的 `user_modified = false`，跳过 `kReuse` 并采集局部邻近不同源 `Status::kValid` 线段（上限 `128` 条）传入 `Request::occupied_wires` 执行避障与拥挤分流求解，随后运行局部 `ChannelNudger` 完成等距分轨。
+2. **原生无损端口更新与路径恢复（`UpdateBlockPins` / `RestoreRoute`）**：
+   * `UpdateBlockPins(block_id, new_rect, new_pins)` 原地更新模块包围盒与端口列表，自动移除失效引脚上的连线，对仍保留引脚上的连线**保持原 `conn_id` 与 `user_modified` 锁定状态**并置脏待重算；`RestoreRoute(conn_id, route)` 用于轻量增量 `Undo/Redo` 微秒级回放路径状态。
+3. **手动拖拽连线线段与同源主干随拖联动（`MoveRouteSegment`）**：
+   * 拖动中间段（`1 <= seg_index <= pts.size() - 3`）时平移该段端点坐标，拖动 2 点直连或首/末段时自动插入正交折弯；同时自动查找同源 `(src, sp)` 兄弟连线中共线重叠的共享主干段同步平移并置 `user_modified = true`，保持 T 型焊点不断裂。
+   * **禁止推动非关联线**：`MoveRouteSegment()` 与鼠标松手绝不触发 `ChannelNudger`，手调线严格停留在用户指定位置（撞障即置为 `Status::kDisplayOnly`），保证周边任意连线零扰动。
+4. **显式整理连线（`AutoRouteConnectors(conn_ids)`）**：
+   * 仅当用户显式触发整理时，清除指定连线的 `user_modified = false`，跳过 `kReuse` 并采集局部邻近不同源 `Status::kValid` 线段（上限 `128` 条）传入 `Request::occupied_wires` 执行避障与拥挤分流求解，随后运行局部 `ChannelNudger` 完成等距分轨。
 
 ## 4. 核心数据结构与配置参考
 
@@ -264,14 +266,13 @@ localroute::LocalOrthogonalRouter router(cfg, std::make_shared<CustomSolver>());
 ## 6. 线程安全与 `qt_demo` 交互能力说明
 
 1. **同步对象线程契约**：`LocalOrthogonalRouter` 本身不是线程安全的；除其内部 `RouteAllParallel()` 冻结只读阶段外，禁止多线程并发读写同一实例。
-2. **异步拓扑变更规则**：`AsyncLocalRouter` 面向已建好拓扑的编辑会话；执行增删模块/连线等拓扑结构变更时，应先销毁旧会话（或 `Clone()` 重建后调用 `StartDirty()` / `StartAll()`）再创建新会话。
-3. **GUI 渲染与自由建模能力（`qt_demo`）**：
-   * 渲染层通过 `view().QueryBlocks(viewport)` 做模块视口裁剪、为每条连线缓存包围盒做 $O(1)$ 裁剪，并在低缩放倍率下启用合批绘制与 LOD。
-   * **同源焊点与交叉跳线弧**：`zoom >= 0.25` 时调用 `view().ComputeSolderJoints(visible_conn_ids)` 绘制实心同源分叉焊点圆点；`zoom >= 0.4` 且开启工具栏 `交叉跳线弧 (Hops)`（默认勾选）时，对视口内不同源正交交叉切开水平段并绘制向上半圆跳线弧。
-   * **手动拖拽连线线段与 `Auto-route`**：`zoom >= 0.25` 时悬停连线线段（`<= 5.0 px`）切换 `Qt::SizeVerCursor` / `Qt::SizeHorCursor`，左键拖动实时调用 `MoveRouteSegment()` 并置位 `user_modified` 锁定；工具栏新增 `整理选中线 (Auto-route)` 按钮，对当前选中连线或选中模块关联连线调用 `AutoRouteConnectors()` 恢复最优避障与通道分轨。
-   * **端口对齐直线吸附（Smart Guides）**：单模块拖拽（`selected_blocks.size() == 1` 且未按住 `Alt` 键）时，直连同向端口坐标差 `<= 5.0` 自动吸附拉直并绘制淡蓝虚线参考线，松手后参考线自动消失。
-   * 支持从左侧**图元库（`LibraryWidget`）**拖拽 7 类预设模块到画布（或从 `0 模块 (空白画布)` 起步），右侧面板及右键菜单支持动态修改选中模块四向端口个数（`左/右 0~16`、`上/下 0~8`），并支持悬停端口拖拽手动连线与 `Del` 删除。
-   * 工具栏内置 `预设: B1-B2 10线平行对连` 与 `预设: B9/B3/B8 级联布线` 视觉验收场景，配合 `通道分轨 (Nudging)` 复选框可一键开关对比分轨效果；默认以普通深蓝线条绘制 `Status::kDisplayOnly` 兜底线以对齐 Simulink 视觉观感，同时提供 `高亮兜底线 (Debug)` 复选框（默认关闭）支持橙色高亮调试。
+2. **异步增量拓扑变更规则**：`AsyncLocalRouter` 通过 `AddBlock`、`RemoveBlock`、`AddConnector`、`RemoveConnector` 与 `UpdateBlockPins` 原生支持运行时增量拓扑编辑（与 `Move` 共用 FIFO `pending_ops_` 队列并递增 `generation_`），无需销毁重建会话或整图 `Clone()`。
+3. **GUI 渲染与 Simulink 对标交互能力（`qt_demo`）**：
+   * **视口裁剪、增量缓存与入线箭头**：通过 `view().QueryBlocks(viewport)` 做模块裁剪、增量维护 `route_cache_` 避免全图重建；`zoom >= 0.45` 时在目标端口绘制实心入线方向箭头（低缩放 LOD 自动剔除以保帧率）。
+   * **同源焊点、交叉跳线弧与撞障警示**：`zoom >= 0.25` 时绘制同源分叉焊点圆点；`zoom >= 0.4` 且开启 `交叉跳线弧 (Hops)` 时绘制向上半圆跳线弧；手调线段碰撞障碍物（`user_modified && Status::kDisplayOnly`）时固定以红色虚线警示，常规兜底线默认深蓝渲染并支持 `高亮兜底线 (Debug)` 开关。
+   * **多方式连线与主干随拖**：支持从端口圆点拉线，以及在已有信号线上 **`Ctrl+左键拖拽`** 直接分叉引出同源新分支；直接拖拽线段可平移线段并自动联动同源共享主干，拖拽过程支持向起止端口坐标直线吸附（`<= 5.0`，按住 `Alt` 取消），松手不推动任何旁路非关联线；点 `整理选中线 (Auto-route)` 恢复避障与分轨。
+   * **轻量增量 Undo/Redo 与建模操作**：支持 `Ctrl+Z / Ctrl+Y`（及工具栏按钮）基于轻量增量 `EditCommand` 回放移动、增删、改端口、手调线与 `Auto-route`（10k 规模 `< 1 ms`）；支持 `Ctrl+拖拽` 模块复制（`>= 5 px` 触发，保留 `Ctrl+点击` 多选）、端口对齐 Smart Guides、工具栏 `导出 SVG` 以及左侧图元库拖放、右键/面板动态修改端口数。
+   * **无黑框桌面启动**：Windows 下以 `WIN32` 子系统链接 `Qt5::WinMain`，双击不弹出控制台黑框；命令行传入 `--smoke-bench` 时自动通过 `AttachConsole(ATTACH_PARENT_PROCESS)` 恢复控制台/管道输出（并支持 `--smoke-out <path>`）。
 4. **近距模块缓冲**：若业务画布允许两个相连模块间距小于 `2 * cfg.buffer`（默认 `16 px`），建议将 `cfg.buffer` 调至 `4.0 ~ 6.0` 以减少缓冲框互叠导致的 `Status::kDisplayOnly` 退化。
 
 ## 7. 万级规模实测性能基线（Release `-O3`，开启 `enable_channel_nudging = true`）
@@ -280,10 +281,10 @@ localroute::LocalOrthogonalRouter router(cfg, std::make_shared<CustomSolver>());
 
 | 场景（10,000 模块 / 20,000 连线） | 指标 | 实测表现 |
 | :--- | :--- | :--- |
-| 同步 4 线程全图冷启动（`D_cold`） | 总耗时 / 合法率 | **2.42 s**（两次独立实测 `2415.96 ~ 2722.82 ms`） / **99.53%**（19,906 Valid, 94 DisplayOnly, 0 Failed） |
-| 同步单长线局部拖拽（`D_drag`，10 帧） | P50 / P99 | **0.298 ~ 0.560 ms** / **0.728 ~ 1.341 ms**（优化前 `0.680 ms` / `2.431 ms`） |
-| 同步单模块拖拽（`A`，200 帧） | P50 / P99 | **0.338 ~ 0.359 ms** / **4.649 ~ 5.094 ms**（mean `0.546 ~ 0.551 ms`，非关联线误提交 0） |
-| 同步 20 模块框选拖拽（`B20`，200 帧） | P50 / P99 | **1.303 ~ 1.461 ms** / **4.818 ~ 11.612 ms**（mean `1.630 ~ 2.145 ms`） |
-| 同步穿插密集连线区（`C`，200 帧） | P50 / P99 | **0.619 ~ 0.646 ms** / **2.611 ~ 3.530 ms**（P95 `1.477 ~ 1.771 ms`，非关联线误提交 0） |
-| `qt_demo` Async 10k 交互冒烟（含焊点+跳线弧） | `Route Time` / `Paint Time` | **0.021 ~ 0.056 ms** / **6.41 ~ 8.38 ms** |
-| `qt_demo` Sync 10k 局部渲染（含焊点+跳线弧） | `Paint Time` | **8.87 ~ 9.27 ms** |
+| 同步 4 线程全图冷启动（`D_cold`） | 总耗时 / 合法率 | **2.35 s**（`2346.29 ms`） / **99.53%**（19,906 Valid, 94 DisplayOnly, 0 Failed） |
+| 同步单长线局部拖拽（`D_drag`，10 帧） | P50 / P99 | **0.361 ms** / **0.937 ms** |
+| 同步单模块拖拽（`A`，200 帧） | P50 / P99 | **0.410 ms** / **4.556 ms**（mean `0.614 ms`，非关联线误提交 0） |
+| 同步 20 模块框选拖拽（`B20`，200 帧） | P50 / P99 | **1.445 ms** / **4.986 ms**（mean `1.608 ms`） |
+| 同步穿插密集连线区（`C`，200 帧） | P50 / P99 | **0.604 ms** / **1.690 ms**（P95 `1.175 ms`，非关联线误提交 0） |
+| `qt_demo` Async 10k 交互冒烟（含箭头/焊点/跳线弧） | `Paint Time` / 增量 `Undo` / `Redo` | **5.66 ~ 8.85 ms** / **0.978 ms** / **0.117 ms** |
+| `qt_demo` Sync 10k 局部渲染（含箭头/焊点/跳线弧） | `Paint Time` | **6.84 ~ 8.72 ms** |

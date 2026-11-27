@@ -40,6 +40,11 @@ class CanvasWidget : public QWidget {
   void RouteAll();
   void FitAll();
   void ResetLocalView();
+  bool ExportViewportSvg(const QString& path) const;
+  bool Undo();
+  bool Redo();
+  bool can_undo() const { return !undo_stack_.empty(); }
+  bool can_redo() const { return !redo_stack_.empty(); }
 
   localroute::Id AddBlockFromTemplate(const BlockTemplate& tmpl,
                                       QPointF world_center);
@@ -78,6 +83,8 @@ class CanvasWidget : public QWidget {
                             double new_coord);
   std::vector<localroute::Id> StepSmokeAutoRoute(
       const std::vector<localroute::Id>& conn_ids);
+  double StepSmokeUndo(bool* ok_out = nullptr);
+  double StepSmokeRedo(bool* ok_out = nullptr);
 
  signals:
   void StatusChanged();
@@ -131,12 +138,43 @@ class CanvasWidget : public QWidget {
     double span1 = 0.0;
   };
 
+  struct EditCommand {
+    enum class Kind {
+      kMoveBlocks,
+      kAddItems,
+      kDeleteItems,
+      kUpdatePins,
+      kModifyRoutes,
+    };
+    Kind kind = Kind::kMoveBlocks;
+    std::vector<std::pair<localroute::Id, localroute::Rect>> before_rects;
+    std::vector<std::pair<localroute::Id, localroute::Rect>> after_rects;
+    std::vector<localroute::Block> blocks;
+    std::vector<localroute::Conn> conns;
+    std::vector<std::pair<localroute::Id, localroute::Route>> before_routes;
+    std::vector<std::pair<localroute::Id, localroute::Route>> after_routes;
+    localroute::Id pin_block_id = 0;
+    localroute::Rect old_rect{};
+    localroute::Rect new_rect{};
+    std::vector<localroute::Pin> old_pins;
+    std::vector<localroute::Pin> new_pins;
+  };
+
   const localroute::LocalOrthogonalRouter& ActiveView() const;
   void InstallInitialRouter(localroute::LocalOrthogonalRouter initial);
-  void ApplyModelEdit(const std::function<std::vector<localroute::Id>(
-                          localroute::LocalOrthogonalRouter*)>& edit_fn);
+  void PushUndoCommand(EditCommand cmd);
+  void ApplyBlockMovesDelta(
+      const std::vector<std::pair<localroute::Id, localroute::Rect>>& moves);
+  void AddBlockIncremental(localroute::Block blk);
+  void RemoveBlockIncremental(localroute::Id bid);
+  void AddConnectorIncremental(localroute::Conn conn,
+                               const localroute::Route* opt_route = nullptr);
+  void RemoveConnectorIncremental(localroute::Id cid);
+  void RefreshAfterIncrementalEdit();
   void RefreshWorldBounds();
   void RebuildRouteCache();
+  void AddRouteCacheEntry(localroute::Id conn_id);
+  void RemoveRouteCacheEntry(localroute::Id conn_id);
   void UpdateRouteCacheForIds(const std::vector<localroute::Id>& ids);
   void UpdateRouteBoundsFromBlock(localroute::Id block_id);
   void RecordRouteSample(double ms);
@@ -186,11 +224,21 @@ class CanvasWidget : public QWidget {
   bool has_selected_conn_ = false;
   localroute::Id selected_conn_id_ = 0;
 
-  // Segment drag & Smart Guides state
+  // Segment drag, Ctrl+Drag duplicate, & Smart Guides state
   localroute::Id drag_seg_conn_id_ = 0;
   std::size_t drag_seg_index_ = 0;
   bool drag_seg_is_vertical_ = false;
+  std::vector<std::pair<localroute::Id, localroute::Route>>
+      seg_drag_before_routes_;
   std::vector<SmartGuideLine> active_guides_;
+  bool ctrl_dup_armed_ = false;
+  localroute::Id ctrl_click_block_ = 0;
+  QPointF ctrl_press_screen_;
+  bool ctrl_click_was_selected_ = false;
+  bool has_pending_dup_cmd_ = false;
+  EditCommand pending_dup_cmd_;
+  std::deque<EditCommand> undo_stack_;
+  std::deque<EditCommand> redo_stack_;
 
   // Interactive wiring & library drop ghost state
   PinHit hover_pin_;

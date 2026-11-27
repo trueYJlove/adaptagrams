@@ -1,8 +1,10 @@
 #include "main_window.h"
 
 #include <QDockWidget>
+#include <QFileDialog>
 #include <QFormLayout>
 #include <QGroupBox>
+#include <QMessageBox>
 #include <QSignalBlocker>
 #include <QStatusBar>
 #include <QToolBar>
@@ -62,14 +64,21 @@ MainWindow::MainWindow(unsigned initial_scale, QWidget* parent)
   toolbar->addWidget(hops_check_);
 
   toolbar->addSeparator();
+  undo_btn_ = new QPushButton("撤销 (Ctrl+Z)", toolbar);
+  redo_btn_ = new QPushButton("重做 (Ctrl+Y)", toolbar);
   auto* fit_btn = new QPushButton("适应全图 (F)", toolbar);
   auto* reset_btn = new QPushButton("局部 100% 视角 (R)", toolbar);
   auto* route_all_btn = new QPushButton("重新全图布线", toolbar);
   auto_route_btn_ = new QPushButton("整理选中线 (Auto-route)", toolbar);
+  auto* export_svg_btn = new QPushButton("导出 SVG", toolbar);
+  toolbar->addWidget(undo_btn_);
+  toolbar->addWidget(redo_btn_);
+  toolbar->addSeparator();
   toolbar->addWidget(fit_btn);
   toolbar->addWidget(reset_btn);
   toolbar->addWidget(route_all_btn);
   toolbar->addWidget(auto_route_btn_);
+  toolbar->addWidget(export_svg_btn);
 
   BuildDocks();
 
@@ -86,6 +95,8 @@ MainWindow::MainWindow(unsigned initial_scale, QWidget* parent)
           &MainWindow::OnHighlightFallbackToggled);
   connect(hops_check_, &QCheckBox::toggled, this,
           &MainWindow::OnLineHopsToggled);
+  connect(undo_btn_, &QPushButton::clicked, this, &MainWindow::OnUndoClicked);
+  connect(redo_btn_, &QPushButton::clicked, this, &MainWindow::OnRedoClicked);
   connect(fit_btn, &QPushButton::clicked, canvas_, &CanvasWidget::FitAll);
   connect(reset_btn, &QPushButton::clicked, canvas_,
           &CanvasWidget::ResetLocalView);
@@ -93,6 +104,8 @@ MainWindow::MainWindow(unsigned initial_scale, QWidget* parent)
           &CanvasWidget::RouteAll);
   connect(auto_route_btn_, &QPushButton::clicked, this,
           &MainWindow::OnAutoRouteClicked);
+  connect(export_svg_btn, &QPushButton::clicked, this,
+          &MainWindow::OnExportSvgClicked);
   connect(canvas_, &CanvasWidget::StatusChanged, this,
           &MainWindow::UpdateStatusSummary);
   connect(canvas_, &CanvasWidget::SelectionChanged, this,
@@ -229,6 +242,21 @@ void MainWindow::OnLineHopsToggled(bool checked) {
 
 void MainWindow::OnAutoRouteClicked() { (void)canvas_->AutoRouteSelection(); }
 
+void MainWindow::OnUndoClicked() { (void)canvas_->Undo(); }
+
+void MainWindow::OnRedoClicked() { (void)canvas_->Redo(); }
+
+void MainWindow::OnExportSvgClicked() {
+  const QString path = QFileDialog::getSaveFileName(
+      this, "导出当前视口 SVG", "viewport_routes.svg", "SVG Files (*.svg)");
+  if (path.isEmpty()) {
+    return;
+  }
+  if (!canvas_->ExportViewportSvg(path)) {
+    QMessageBox::warning(this, "导出失败", "无法写入 SVG 文件到所选路径。");
+  }
+}
+
 void MainWindow::OnPortSpinChanged() {
   if (updating_inspector_) {
     return;
@@ -274,9 +302,16 @@ void MainWindow::SyncInspectorFromSelection() {
 }
 
 void MainWindow::UpdateStatusSummary() {
+  if (undo_btn_) {
+    undo_btn_->setEnabled(canvas_->can_undo());
+  }
+  if (redo_btn_) {
+    redo_btn_->setEnabled(canvas_->can_redo());
+  }
   statusBar()->showMessage(
-      QString("滚轮缩放 | 中键或空格+左键平移 | 悬停端口拖线 | Del 删除 | F "
-              "全图 / R 局部 | %1 模块 / %2 连线 | Route %3 ms | Paint %4 ms")
+      QString("滚轮缩放 | 中键或空格+左键平移 | 悬停端口拖线 / Ctrl+线拖分叉 | "
+              "Ctrl+拖块复制 | Ctrl+Z/Y | Del 删除 | %1 模块 / %2 连线 | Route "
+              "%3 ms | Paint %4 ms")
           .arg(canvas_->block_count())
           .arg(canvas_->conn_count())
           .arg(canvas_->last_route_ms(), 0, 'f', 3)
